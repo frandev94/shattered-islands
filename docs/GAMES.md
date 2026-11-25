@@ -24,7 +24,7 @@ Qué se mide en cada prueba:
 |---|---|---|---|---|---|
 | Bloc de notas | Win32 nativo | prototipo v0.1 (`1b5c142`) | 2026-11-25 | ✅ | Aplica y restaura exacto, 5/5 con retraso |
 | Total War: Warhammer III | Warscape | prototipo v0.1 (`1b5c142`) | 2026-11-25 | ❌ | El juego revierte estilo y tamaño; ver causa en `preferences.script.txt` |
-| Phoenix Wright: Ace Attorney Trilogy | — | — | — | ❓ | Pendiente |
+| Phoenix Wright: Ace Attorney Trilogy | Unity | `8fb1b51` | 2026-11-25 | ⚠️ | Quita el marco; Unity fuerza 1280x720 y reposiciona |
 
 ## Bloc de notas
 
@@ -66,7 +66,52 @@ Es coherente con el tamaño inmutable observado. Hay precedente en el mismo moto
 
 ## Phoenix Wright: Ace Attorney Trilogy
 
-Pendiente de probar. Es el siguiente juego real previsto. Registrar los datos según la sección «Cómo añadir un juego».
+Proceso `PWAAT.exe` (Steam, `<Steam library>\steamapps\common\Phoenix Wright Ace Attorney Trilogy\`), motor Unity (`UnityPlayer.dll`, `PWAAT_Data`, clase de ventana `UnityWndClass`), 32 bits, en modo ventana, sin elevar y lanzado sin argumentos de Unity. Monitor único de 4096x1152.
+
+**Configuración:** registro `HKCU\Software\CAPCOM\Phoenix Wright: Ace Attorney Trilogy / …` (solo lectura):
+
+- `Screenmanager Resolution Width`: 1600
+- `Screenmanager Resolution Height`: 900
+- `Screenmanager Is Fullscreen mode`: 0
+
+No coincide con el cliente real, que es 1280x720. El origen del 1280x720 es desconocido.
+
+**Estado original:** style `0x14CA0000`, ex-style `0x100`, rect `[231,223,1516,971]`, cliente 1280x720.
+
+**Cronología medida, inmediata:**
+
+| Momento | Evento | Valores |
+|---|---|---|
+| +48 ms | Se quita el estilo y no se repone | style `0x14000000`, ex-style `0` |
+| +69 ms | Nuestro `SetWindowPos` a `rcMonitor` | rect `rcMonitor` |
+| +130 ms | Unity redimensiona a su cliente y reposiciona | `[2126,0,3406,720]` |
+| +150 ms | Nuestra app vuelve a afirmar la ventana | — |
+| +186 ms | Unity revierte el tamaño otra vez | final 1280x720 en x=2126 |
+
+**Cronología medida, con retraso de 3000 ms:**
+
+| Momento | Evento | Valores |
+|---|---|---|
+| ~+48 ms | Unity ya había devuelto la ventana a su tamaño | 1280x720 en x=1732 |
+| ~3053 ms | Se quita el estilo y no se repone | style `0x14000000`, ex-style `0` |
+| ~3091 ms | Nuestro `SetWindowPos` a `rcMonitor` | rect `rcMonitor` |
+| ~3153 ms (≈ +62 ms) | Unity revierte el tamaño | final 1280x720 en x=1852 |
+
+La posición final cambia de una prueba a otra (2126 en la inmediata, 1852 en la retardada). Su origen es desconocido.
+
+- `WM_QUIT` → restauración exacta, en ambas pruebas.
+
+**Comparación:**
+
+- Frente a TW:WH3 (`warscape`): aquí Unity no repone el estilo, así que el marco queda quitado. Ambos juegos revierten el tamaño.
+- Frente a `testwin --mode force-size`: mismo comportamiento (estilo aceptado, tamaño forzado), más el reposicionamiento.
+
+**Estado ⚠️:** el marco se mantiene quitado, pero el tamaño no. La leyenda no tiene estado parcial; se usa ⚠️ porque la ventana sí queda sin marco.
+
+**Ideas sin probar (investigación en curso):**
+
+- Lanzar con argumentos de Unity: `-popupwindow`, `-screen-width` / `-screen-height`.
+- Fijar en PlayerPrefs la resolución al tamaño de la isla antes de lanzar.
 
 ## Juego de prueba `testwin`
 
