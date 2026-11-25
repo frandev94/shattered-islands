@@ -15,6 +15,11 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/).
 - Icono de bandeja con «Aplicar», «Restaurar todo», «Recargar» y «Salir».
 - Licencia MIT.
 - Herramienta de prueba `examples/testwin` (`27f1555`) con seis modos que reproducen comportamientos observados en juegos: `normal`, `fixed`, `revert-style`, `force-size`, `warscape` y `late-frame`.
+- testwin: comportamientos combinables (estilo, revertir estilo, forzar tamaño, recolocar, marco tardío, DPI) y presets medidos en juegos reales: `warscape` (TW:WH3), `unity` y `unity-popup` (Phoenix Wright), `notepad`.
+
+### Cambiado
+
+- Documentación corregida a píxeles físicos (monitor 5120x1440 al 125 %; islas de 2560x1440).
 
 ### Corregido
 

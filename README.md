@@ -17,7 +17,7 @@ Versión 0.1:
 
 Prototipo v0.1.
 
-Probado (2026-11-25, un solo monitor de 4096x1152):
+Probado (2026-11-25, un solo monitor de 5120x1440 físicos a 125 % de escala; las primeras lecturas, de 4096x1152, estaban virtualizadas):
 
 - Notepad: aplica y restaura de forma exacta; con retardo de 1500 ms, 5 de 5 exactas.
 - Ventana de prueba `testwin`, 12 escenarios (inmediato y con retardo de 1500 ms): restauración exacta en todos.
@@ -90,28 +90,42 @@ Procesos excluidos siempre (nunca se tocan): `explorer.exe`, `dwm.exe`, `shellex
 
 ## Juego de prueba
 
-`testwin` es una ventana que imita comportamientos de juegos reales:
+`testwin` (`examples/testwin.rs`) es una ventana falsa que reproduce cómo se defienden los juegos cuando una herramienta les quita el marco o les cambia el tamaño. Sirve para probar la app sin depender de un juego concreto.
 
 ```
-cargo run --example testwin -- --mode warscape
+cargo run --example testwin -- --preset warscape
+cargo run --example testwin -- --preset unity --log testwin.log
+cargo run --example testwin -- --style fixed --revert-style 8 --force-size 2 --reposition keep --dpi unaware --client 1920x1080
 ```
 
-Opciones: `--mode`, `--client WxH` (por defecto 1280x720), `--pos X,Y` (por defecto 100,100), `--delay MS` (por defecto 1500), `--title TEXT`, `--log PATH`.
+Presets (medidos en juegos reales; detalle en `docs/GAMES.md`):
 
-| Modo | Comportamiento |
+| Preset | Reproduce |
 |---|---|
-| `normal` | Ventana normal con marco; acepta los cambios |
-| `fixed` | Ventana de tamaño fijo; acepta los cambios |
-| `revert-style` | Restaura su marco casi al instante; conserva el tamaño |
-| `force-size` | Acepta quitar el marco pero fuerza su tamaño original en 0,0 |
-| `warscape` | Combina `revert-style` y `force-size`: reproduce Total War: WARHAMMER III |
-| `late-frame` | Acepta los cambios y recupera el marco ~1500 ms después |
+| `notepad` | Aplicación cooperativa: acepta el cambio sin reaccionar (`--style frame --dpi aware`) |
+| `warscape` | Total War: WARHAMMER III: repone el marco en ~8 ms y fuerza su tamaño en ~2 ms |
+| `unity` | Phoenix Wright (Unity, ventana): quita el estilo sin reponerlo y fuerza 1280x720 a los ~60 ms |
+| `unity-popup` | Phoenix Wright con `-popupwindow` (sin marco): vuelve a 1280x720 en menos de 20 ms |
+
+Flags, tal como aparecen en el código:
+
+- `--preset NOMBRE` y `--mode NOMBRE`: expanden un preset o un modo antiguo; los flags que vienen después lo sobrescriben.
+- `--style frame|fixed|popup` (por defecto `frame`).
+- `--revert-style MS`: repone el estilo tras MS milisegundos.
+- `--force-size MS`: fuerza el tamaño tras MS milisegundos.
+- `--reposition keep|center-on-request|offset:X,Y|game-unity` (por defecto `keep`).
+- `--late-frame MS`: repone el marco tras MS milisegundos.
+- `--dpi aware|unaware` (por defecto `aware`). Con `unaware` Windows virtualiza la ventana: 1920x1080 se ve como 2400x1350 físicos al 125 %.
+- `--client WxH` (por defecto 1280x720, en el espacio DPI de la ventana), `--pos X,Y` (por defecto 100,100), `--delay MS` (por defecto 1500; solo lo usa `late-frame`), `--title TEXT`, `--log PATH`.
+
+Los nombres de `--mode` antiguos (`normal`, `fixed`, `revert-style`, `force-size`, `warscape`, `late-frame`) siguen funcionando.
 
 ## Limitaciones conocidas
 
 - Juegos que se defienden: Total War: WARHAMMER III revierte el estilo (~8 ms) y fuerza el tamaño (~2 ms). Su causa está en `preferences.script.txt` (`fix_res true`, `fix_window_pos true`). Cambiar esos ajustes para que funcione está sin probar.
 - Ventanas de procesos elevados: sin probar; sin permisos de administrador, Windows puede impedir modificarlas.
 - Un cierre abrupto del programa (fin de proceso, corte de luz) deja las ventanas ya modificadas sin marco; solo la restauración normal las devuelve.
+- Ventanas ya sin marco (p. ej. Unity con `-popupwindow`) se ignoran en v0.1.
 - Solo se ha probado con un monitor.
 
 ## Hoja de ruta
