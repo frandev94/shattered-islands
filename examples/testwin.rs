@@ -1,9 +1,23 @@
-//! Fake "game" window used to reproduce game behaviours locally.
+//! Fake "game" window used to reproduce, locally, what real games do against a borderless tool.
 //!
-//! Usage: testwin [--mode normal|fixed|revert-style|force-size|warscape|late-frame]
-//!                [--client WxH] [--pos X,Y] [--delay MS] [--title TEXT] [--log PATH]
+//! Behaviours are composable flags; `--preset` / `--mode` expand into flags and any flag given after
+//! them overrides. Timed reactions are asynchronous (one `SetTimer` per reaction kind, a later
+//! change re-arms it); a delay of 0 ms means "synchronously, inside the caller's call".
+//!
+//! Usage: testwin [--preset warscape|unity|unity-popup|notepad]
+//!                [--mode normal|fixed|revert-style|force-size|warscape|late-frame]
+//!                [--style frame|fixed|popup] [--revert-style MS] [--force-size MS]
+//!                [--reposition keep|center-on-request|offset:X,Y|game-unity] [--late-frame MS]
+//!                [--dpi aware|unaware] [--client WxH] [--pos X,Y] [--delay MS]
+//!                [--title TEXT] [--log PATH]
+//!
+//! `--client` is in the window's own DPI space: with `--dpi unaware` Windows virtualizes and
+//! bitmap-stretches the window (client 1920x1080 becomes 2400x1350 physical at 125 %).
+//! `--delay` is only the delay of `--mode late-frame` (default 1500).
+//! Limit: `SetTimer` clamps to USER_TIMER_MINIMUM (10 ms) and ticks at the system timer resolution
+//! (~15.6 ms), so reactions of 1-15 ms fire late; the log shows the real wait of each reaction.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -14,31 +28,203 @@ use windows::Win32::Graphics::Gdi::{
     InvalidateRect, PAINTSTRUCT, SetBkColor, SetTextColor, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_CONTEXT_UNAWARE, GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Normal,
+#[derive(Clone, Copy, Debug)]
+enum Style {
+    /// WS_OVERLAPPEDWINDOW.
+    Frame,
+    /// OVERLAPPED | CAPTION | SYSMENU | MINIMIZEBOX | CLIPSIBLINGS (0x14CA0000 with VISIBLE).
     Fixed,
-    RevertStyle,
-    ForceSize,
-    Warscape,
-    LateFrame,
+    /// WS_POPUP | CLIPSIBLINGS (0x94000000 with VISIBLE); ex style stays 0.
+    Popup,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reposition {
+    /// Keep the position the caller set.
+    Keep,
+    /// Centre the forced size on the rect the caller requested.
+    CenterOnRequest,
+    /// Requested left/top plus a fixed offset.
+    Offset(i32, i32),
+    /// Approximation of the measured PWAAT rule x_final = x0 + (x_req - x_ref) / 2 (y = requested).
+    /// The anchor (x_ref, x0) is this window's position at its first reaction, so that one is kept
+    /// and later requests move it at half speed; the real game's x0/x_ref are unknown.
+    GameUnity,
 }
 
 struct Cfg {
-    mode: Mode,
-    mode_name: String,
+    name: String,
+    style: Style,
+    revert_style: Option<u32>,
+    force_size: Option<u32>,
+    reposition: Reposition,
+    late_frame: Option<u32>,
+    dpi_aware: bool,
     client: (i32, i32),
     pos: (i32, i32),
     delay: u32,
-    title: String,
+    title: Option<String>,
     log: Option<String>,
     start: Instant,
 }
 
 static CFG: LazyLock<Cfg> = LazyLock::new(parse_args);
+
+fn cfg() -> &'static Cfg {
+    &CFG
+}
+
+fn num<T: std::str::FromStr>(s: &str) -> T {
+    s.trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("bad number `{s}`"))
+}
+
+fn pair(s: &str, sep: char) -> (i32, i32) {
+    let (a, b) = s
+        .split_once(sep)
+        .unwrap_or_else(|| panic!("expected A{sep}B, got `{s}`"));
+    (num(a), num(b))
+}
+
+/// Flags of a preset or legacy `--mode` name.
+fn expand(name: &str, delay: u32) -> String {
+    let flags = match name {
+        "warscape" => {
+            "--style fixed --revert-style 8 --force-size 2 --reposition keep --dpi unaware --client 1920x1080"
+        }
+        "unity" => {
+            "--style fixed --force-size 60 --reposition game-unity --dpi aware --client 1280x720"
+        }
+        "unity-popup" => {
+            "--style popup --force-size 10 --reposition game-unity --dpi aware --client 1280x720"
+        }
+        "notepad" => "--style frame --dpi aware",
+        "normal" => "--style frame",
+        "fixed" => "--style fixed",
+        "revert-style" => "--style fixed --revert-style 0",
+        "force-size" => "--style fixed --force-size 0 --reposition keep",
+        "late-frame" => return format!("--style frame --late-frame {delay}"),
+        other => panic!("unknown preset/mode {other}"),
+    };
+    flags.into()
+}
+
+fn apply(c: &mut Cfg, flag: &str, val: &str) {
+    match flag {
+        "--style" => {
+            c.style = match val {
+                "frame" => Style::Frame,
+                "fixed" => Style::Fixed,
+                "popup" => Style::Popup,
+                other => panic!("unknown style {other}"),
+            }
+        }
+        "--revert-style" => c.revert_style = Some(num(val)),
+        "--force-size" => c.force_size = Some(num(val)),
+        "--late-frame" => c.late_frame = Some(num(val)),
+        "--reposition" => {
+            c.reposition = match (val, val.strip_prefix("offset:")) {
+                ("keep", _) => Reposition::Keep,
+                ("center-on-request", _) => Reposition::CenterOnRequest,
+                ("game-unity", _) => Reposition::GameUnity,
+                (_, Some(xy)) => {
+                    let (x, y) = pair(xy, ',');
+                    Reposition::Offset(x, y)
+                }
+                _ => panic!("unknown reposition {val}"),
+            }
+        }
+        "--dpi" => {
+            c.dpi_aware = match val {
+                "aware" => true,
+                "unaware" => false,
+                other => panic!("unknown dpi mode {other}"),
+            }
+        }
+        "--client" => c.client = pair(val, 'x'),
+        "--pos" => c.pos = pair(val, ','),
+        "--title" => c.title = Some(val.into()),
+        "--log" => c.log = Some(val.into()),
+        "--delay" => {} // read up front for `--mode late-frame`
+        other => panic!("unknown argument {other}"),
+    }
+}
+
+fn parse_args() -> Cfg {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut c = Cfg {
+        name: "custom".into(),
+        style: Style::Frame,
+        revert_style: None,
+        force_size: None,
+        reposition: Reposition::Keep,
+        late_frame: None,
+        dpi_aware: true,
+        client: (1280, 720),
+        pos: (100, 100),
+        delay: 1500,
+        title: None,
+        log: None,
+        start: Instant::now(),
+    };
+    if let Some(i) = args.iter().position(|a| a == "--delay") {
+        c.delay = num(args.get(i + 1).expect("missing value for --delay"));
+    }
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let val = it
+            .next()
+            .unwrap_or_else(|| panic!("missing value for {flag}"));
+        if flag == "--preset" || flag == "--mode" {
+            c.name = val.clone();
+            let flags = expand(val, c.delay);
+            let mut words = flags.split_whitespace();
+            while let (Some(f), Some(v)) = (words.next(), words.next()) {
+                apply(&mut c, f, v);
+            }
+        } else {
+            apply(&mut c, flag, val);
+        }
+    }
+    c
+}
+
+fn ms(v: Option<u32>) -> String {
+    v.map_or("off".into(), |v| format!("{v} ms"))
+}
+
+/// Active flags, one string per on-screen line.
+fn describe(c: &Cfg) -> [String; 2] {
+    [
+        format!(
+            "style={:?} revert-style={} force-size={}",
+            c.style,
+            ms(c.revert_style),
+            ms(c.force_size)
+        ),
+        format!(
+            "reposition={:?} late-frame={} dpi={} client={}x{}",
+            c.reposition,
+            ms(c.late_frame),
+            if c.dpi_aware { "aware" } else { "unaware" },
+            c.client.0,
+            c.client.1
+        ),
+    ]
+}
+
+// Reaction kinds; the value is also the SetTimer id.
+const T_REVERT: usize = 1;
+const T_FORCE: usize = 2;
+const T_LATE: usize = 3;
 
 #[derive(Default)]
 struct State {
@@ -47,78 +233,19 @@ struct State {
     ready: Cell<bool>,
     saved_style: Cell<u32>,
     saved_ex: Cell<u32>,
+    /// When each reaction kind was (re-)armed; index = kind - 1.
+    armed: [Cell<Option<Instant>>; 3],
+    /// Window rect right after the caller's last size/position change.
+    requested: Cell<RECT>,
+    /// `Reposition::GameUnity` anchor (x_ref, x0).
+    anchor: Cell<Option<(i32, i32)>>,
     reverts: Cell<u32>,
     forced: Cell<u32>,
-    timer_pending: Cell<bool>,
+    rebuilds: Cell<u32>,
+    last: RefCell<String>,
 }
 
 thread_local! { static ST: State = State::default(); }
-
-const TIMER_ID: usize = 1;
-
-fn cfg() -> &'static Cfg {
-    &CFG
-}
-
-fn parse_args() -> Cfg {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut mode_name = "normal".to_string();
-    let (mut client, mut pos, mut delay) = ((1280, 720), (100, 100), 1500u32);
-    let (mut title, mut log) = (None, None);
-    let pair = |s: &str, sep: char| -> (i32, i32) {
-        let (a, b) = s
-            .split_once(sep)
-            .unwrap_or_else(|| panic!("expected A{sep}B, got `{s}`"));
-        (
-            a.trim().parse().expect("bad number"),
-            b.trim().parse().expect("bad number"),
-        )
-    };
-    let mut it = args.iter();
-    while let Some(flag) = it.next() {
-        let val = it
-            .next()
-            .unwrap_or_else(|| panic!("missing value for {flag}"))
-            .clone();
-        match flag.as_str() {
-            "--mode" => mode_name = val,
-            "--client" => client = pair(&val, 'x'),
-            "--pos" => pos = pair(&val, ','),
-            "--delay" => delay = val.parse().expect("bad --delay"),
-            "--title" => title = Some(val),
-            "--log" => log = Some(val),
-            other => panic!("unknown argument {other}"),
-        }
-    }
-    let mode = match mode_name.as_str() {
-        "normal" => Mode::Normal,
-        "fixed" => Mode::Fixed,
-        "revert-style" => Mode::RevertStyle,
-        "force-size" => Mode::ForceSize,
-        "warscape" => Mode::Warscape,
-        "late-frame" => Mode::LateFrame,
-        other => panic!("unknown mode {other}"),
-    };
-    let title = title.unwrap_or_else(|| format!("Shatter TestWin [{mode_name}]"));
-    Cfg {
-        mode,
-        mode_name,
-        client,
-        pos,
-        delay,
-        title,
-        log,
-        start: Instant::now(),
-    }
-}
-
-fn reverts_style(m: Mode) -> bool {
-    matches!(m, Mode::RevertStyle | Mode::Warscape)
-}
-
-fn forces_size(m: Mode) -> bool {
-    matches!(m, Mode::ForceSize | Mode::Warscape)
-}
 
 fn log(msg: &str) {
     let c = cfg();
@@ -131,6 +258,12 @@ fn log(msg: &str) {
     {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// Log a reaction and keep it for the on-screen display.
+fn reaction(msg: String) {
+    log(&msg);
+    ST.with(|s| *s.last.borrow_mut() = msg);
 }
 
 fn style_of(hwnd: HWND) -> (u32, u32) {
@@ -150,6 +283,10 @@ fn window_rect(hwnd: HWND) -> RECT {
     r
 }
 
+fn rect_str(r: &RECT) -> String {
+    format!("[{},{},{},{}]", r.left, r.top, r.right, r.bottom)
+}
+
 fn client_size(hwnd: HWND) -> (i32, i32) {
     let mut r = RECT::default();
     // SAFETY: hwnd is live and `r` is a valid out pointer.
@@ -157,8 +294,8 @@ fn client_size(hwnd: HWND) -> (i32, i32) {
     (r.right - r.left, r.bottom - r.top)
 }
 
-/// Window size needed for a `client` area under the given style.
-fn outer_size(client: (i32, i32), style: u32, ex: u32) -> (i32, i32) {
+/// Window size needed for a `client` area under the given style at `dpi`.
+fn outer_size(client: (i32, i32), style: u32, ex: u32, dpi: u32) -> (i32, i32) {
     let mut r = RECT {
         left: 0,
         top: 0,
@@ -166,7 +303,9 @@ fn outer_size(client: (i32, i32), style: u32, ex: u32) -> (i32, i32) {
         bottom: client.1,
     };
     // SAFETY: `r` is a valid in/out pointer.
-    unsafe { AdjustWindowRectEx(&mut r, WINDOW_STYLE(style), false, WINDOW_EX_STYLE(ex)).ok() };
+    unsafe {
+        AdjustWindowRectExForDpi(&mut r, WINDOW_STYLE(style), false, WINDOW_EX_STYLE(ex), dpi).ok()
+    };
     (r.right - r.left, r.bottom - r.top)
 }
 
@@ -182,63 +321,148 @@ fn guarded(f: impl FnOnce()) {
     ST.with(|s| s.guard.set(false));
 }
 
-fn frame_changed(hwnd: HWND, extra: SET_WINDOW_POS_FLAGS) {
-    let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | extra;
+fn frame_changed(hwnd: HWND) {
+    let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
     // SAFETY: hwnd is live.
     unsafe { SetWindowPos(hwnd, None, 0, 0, 0, 0, flags).ok() };
 }
 
-fn on_style_changed(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
-    // SAFETY: for WM_STYLECHANGED lparam points to a valid STYLESTRUCT.
-    let ss = unsafe { *(lparam.0 as *const STYLESTRUCT) };
-    let which = wparam.0 as i32;
-    let (name, saved) = if which == GWL_STYLE.0 {
-        ("GWL_STYLE", ST.with(|s| s.saved_style.get()))
-    } else if which == GWL_EXSTYLE.0 {
-        ("GWL_EXSTYLE", ST.with(|s| s.saved_ex.get()))
+/// Arm reaction `kind` to fire in `delay` ms (re-arms a pending one); 0 runs it right now.
+fn react(hwnd: HWND, kind: usize, delay: u32) {
+    ST.with(|s| s.armed[kind - 1].set(Some(Instant::now())));
+    log(&format!("armed reaction {kind} in {delay} ms"));
+    if delay == 0 {
+        fire(hwnd, kind);
     } else {
-        return;
-    };
-    let (guard, ready) = ST.with(|s| (s.guard.get(), s.ready.get()));
-    let mut note = String::new();
-    if ready && !guard {
-        let c = cfg();
-        if reverts_style(c.mode) && ss.styleNew != saved {
-            guarded(|| {
-                // SAFETY: hwnd is live.
-                unsafe { SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(which), saved as isize) };
-                frame_changed(hwnd, SET_WINDOW_POS_FLAGS(0));
-            });
-            ST.with(|s| s.reverts.set(s.reverts.get() + 1));
-            note = format!(" -> reverted to 0x{saved:08X}");
-        } else if c.mode == Mode::LateFrame && !ST.with(|s| s.timer_pending.replace(true)) {
-            // SAFETY: hwnd is live; WM_TIMER is delivered to the window procedure.
-            unsafe { SetTimer(Some(hwnd), TIMER_ID, c.delay, None) };
-            note = format!(" -> frame rebuild in {} ms", c.delay);
-        }
+        // SAFETY: hwnd is live; WM_TIMER is delivered to the window procedure.
+        unsafe { SetTimer(Some(hwnd), kind, delay, None) };
     }
-    log(&format!(
-        "WM_STYLECHANGED {name} style=0x{:08X}{note}",
-        ss.styleNew
-    ));
+}
+
+fn fire(hwnd: HWND, kind: usize) {
+    // SAFETY: hwnd is live; killing an unarmed timer just fails.
+    unsafe { _ = KillTimer(Some(hwnd), kind) };
+    let waited = ST
+        .with(|s| s.armed[kind - 1].take())
+        .map_or(0, |t| t.elapsed().as_millis());
+    match kind {
+        T_REVERT => revert_style(hwnd, waited),
+        T_FORCE => force_size(hwnd, waited),
+        _ => late_frame(hwnd, waited),
+    }
     invalidate(hwnd);
 }
 
-fn on_late_frame(hwnd: HWND) {
-    // SAFETY: hwnd is live.
-    unsafe { _ = KillTimer(Some(hwnd), TIMER_ID) };
-    ST.with(|s| s.timer_pending.set(false));
+/// The style/ex style this window wants; minimize/maximize are state, not style, so they follow.
+fn wanted(hwnd: HWND) -> (u32, u32) {
+    let live = (WS_MINIMIZE | WS_MAXIMIZE).0;
+    let (st, _) = style_of(hwnd);
+    let (saved, ex) = ST.with(|s| (s.saved_style.get(), s.saved_ex.get()));
+    ((saved & !live) | (st & live), ex)
+}
+
+fn revert_style(hwnd: HWND, waited: u128) {
+    let (st, ex) = style_of(hwnd);
+    let (want_st, want_ex) = wanted(hwnd);
+    if (st, ex) == (want_st, want_ex) {
+        return;
+    }
+    guarded(|| {
+        // SAFETY: hwnd is live.
+        unsafe {
+            if st != want_st {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, want_st as isize);
+            }
+            if ex != want_ex {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want_ex as isize);
+            }
+        }
+        frame_changed(hwnd);
+    });
+    ST.with(|s| s.reverts.set(s.reverts.get() + 1));
+    reaction(format!(
+        "revert-style after {waited} ms: 0x{st:08X}/0x{ex:08X} -> 0x{want_st:08X}/0x{want_ex:08X}"
+    ));
+}
+
+fn late_frame(hwnd: HWND, waited: u128) {
     let (style, _) = style_of(hwnd);
     let new = style | (WS_CAPTION | WS_THICKFRAME).0;
     guarded(|| {
         // SAFETY: hwnd is live.
         unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new as isize) };
-        frame_changed(hwnd, SET_WINDOW_POS_FLAGS(0));
+        frame_changed(hwnd);
     });
-    ST.with(|s| s.reverts.set(s.reverts.get() + 1));
-    log(&format!(
-        "WM_TIMER late-frame style 0x{style:08X} -> 0x{new:08X}"
+    ST.with(|s| s.rebuilds.set(s.rebuilds.get() + 1));
+    reaction(format!(
+        "late-frame after {waited} ms: style 0x{style:08X} -> 0x{new:08X}"
     ));
+}
+
+fn force_size(hwnd: HWND, waited: u128) {
+    let c = cfg();
+    // SAFETY: hwnd is live.
+    if client_size(hwnd) == c.client || unsafe { IsIconic(hwnd).as_bool() } {
+        return;
+    }
+    let (style, ex) = style_of(hwnd);
+    // SAFETY: hwnd is live.
+    let (w, h) = outer_size(c.client, style, ex, unsafe { GetDpiForWindow(hwnd) });
+    let (req, now) = (ST.with(|s| s.requested.get()), window_rect(hwnd));
+    let (x, y) = match c.reposition {
+        Reposition::Keep => (now.left, now.top),
+        Reposition::CenterOnRequest => (
+            (req.left + req.right - w) / 2,
+            (req.top + req.bottom - h) / 2,
+        ),
+        Reposition::Offset(dx, dy) => (req.left + dx, req.top + dy),
+        Reposition::GameUnity => {
+            let (x_ref, x0) = ST.with(|s| {
+                let a = s.anchor.get().unwrap_or((req.left, now.left));
+                s.anchor.set(Some(a));
+                a
+            });
+            (x0 + (req.left - x_ref) / 2, req.top)
+        }
+    };
+    guarded(|| {
+        // SAFETY: hwnd is live.
+        unsafe { SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE).ok() };
+    });
+    ST.with(|s| s.forced.set(s.forced.get() + 1));
+    let (res, size) = (window_rect(hwnd), client_size(hwnd));
+    reaction(format!(
+        "force-size after {waited} ms: requested {} -> result {} client={}x{}",
+        rect_str(&req),
+        rect_str(&res),
+        size.0,
+        size.1
+    ));
+}
+
+fn on_style_changed(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    // SAFETY: for WM_STYLECHANGED lparam points to a valid STYLESTRUCT.
+    let ss = unsafe { *(lparam.0 as *const STYLESTRUCT) };
+    let name = match wparam.0 as i32 {
+        x if x == GWL_STYLE.0 => "GWL_STYLE",
+        x if x == GWL_EXSTYLE.0 => "GWL_EXSTYLE",
+        _ => return,
+    };
+    log(&format!(
+        "WM_STYLECHANGED {name} 0x{:08X} -> 0x{:08X}",
+        ss.styleOld, ss.styleNew
+    ));
+    if ST.with(|s| s.ready.get() && !s.guard.get()) {
+        let c = cfg();
+        if let Some(d) = c.revert_style
+            && style_of(hwnd) != wanted(hwnd)
+        {
+            react(hwnd, T_REVERT, d);
+        }
+        if let Some(d) = c.late_frame {
+            react(hwnd, T_LATE, d);
+        }
+    }
     invalidate(hwnd);
 }
 
@@ -246,101 +470,79 @@ fn on_pos_changed(hwnd: HWND) {
     let r = window_rect(hwnd);
     let size = client_size(hwnd);
     log(&format!(
-        "WM_WINDOWPOSCHANGED rect=[{},{},{},{}] client={}x{}",
-        r.left, r.top, r.right, r.bottom, size.0, size.1
+        "WM_WINDOWPOSCHANGED rect={} client={}x{}",
+        rect_str(&r),
+        size.0,
+        size.1
     ));
     let c = cfg();
     // SAFETY: hwnd is live.
     let iconic = unsafe { IsIconic(hwnd).as_bool() };
-    if forces_size(c.mode)
+    if let Some(d) = c.force_size
         && ST.with(|s| s.ready.get() && !s.guard.get())
         && !iconic
         && size != c.client
     {
-        let (style, ex) = style_of(hwnd);
-        let (w, h) = outer_size(c.client, style, ex);
-        guarded(|| {
-            // SAFETY: hwnd is live.
-            unsafe {
-                SetWindowPos(
-                    hwnd,
-                    None,
-                    0,
-                    0,
-                    w,
-                    h,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                .ok()
-            };
-        });
-        ST.with(|s| s.forced.set(s.forced.get() + 1));
-        log(&format!(
-            "forced size back to {w}x{h} (client {}x{})",
-            c.client.0, c.client.1
-        ));
+        ST.with(|s| s.requested.set(r));
+        react(hwnd, T_FORCE, d);
     }
     invalidate(hwnd);
 }
 
 fn on_paint(hwnd: HWND) {
+    let c = cfg();
     let (style, ex) = style_of(hwnd);
     let r = window_rect(hwnd);
     let (cw, ch) = client_size(hwnd);
-    let (reverts, forced) = ST.with(|s| (s.reverts.get(), s.forced.get()));
+    let (reverts, forced, rebuilds, last) = ST.with(|s| {
+        (
+            s.reverts.get(),
+            s.forced.get(),
+            s.rebuilds.get(),
+            s.last.borrow().clone(),
+        )
+    });
+    // SAFETY: hwnd is live.
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let [flags1, flags2] = describe(c);
     let lines = [
-        format!("mode: {}", cfg().mode_name),
-        format!("style: 0x{style:08X}  exstyle: 0x{ex:08X}"),
+        format!("preset/mode: {}", c.name),
+        flags1,
+        flags2,
+        format!("style: 0x{style:08X}  exstyle: 0x{ex:08X}  window dpi: {dpi}"),
         format!(
-            "window rect: [{},{},{},{}] ({}x{})",
-            r.left,
-            r.top,
-            r.right,
-            r.bottom,
+            "window rect: {} ({}x{})",
+            rect_str(&r),
             r.right - r.left,
             r.bottom - r.top
         ),
         format!("client: {cw}x{ch}"),
-        format!("reverts/rebuilds: {reverts}  forced resizes: {forced}"),
+        format!("style reverts: {reverts}  forced resizes: {forced}  late frames: {rebuilds}"),
+        format!("last: {last}"),
     ];
     let mut ps = PAINTSTRUCT::default();
+    let full = RECT {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: ch,
+    };
     // SAFETY: standard BeginPaint/EndPaint pairing on a live window; every GDI object created here is deleted.
     unsafe {
         let hdc = BeginPaint(hwnd, &mut ps);
-        let cell = 64;
-        let (a, b, border) = (
+        let (bg, border) = (
             CreateSolidBrush(COLORREF(0x00604030)),
-            CreateSolidBrush(COLORREF(0x00907060)),
             CreateSolidBrush(COLORREF(0x000000FF)),
         );
-        for (row, y) in (0..ch).step_by(cell as usize).enumerate() {
-            for (col, x) in (0..cw).step_by(cell as usize).enumerate() {
-                let rc = RECT {
-                    left: x,
-                    top: y,
-                    right: (x + cell).min(cw),
-                    bottom: (y + cell).min(ch),
-                };
-                FillRect(hdc, &rc, if (row + col) % 2 == 0 { a } else { b });
-            }
-        }
-        FrameRect(
-            hdc,
-            &RECT {
-                left: 0,
-                top: 0,
-                right: cw,
-                bottom: ch,
-            },
-            border,
-        );
+        FillRect(hdc, &full, bg);
+        FrameRect(hdc, &full, border);
         SetTextColor(hdc, COLORREF(0x00FFFFFF));
-        SetBkColor(hdc, COLORREF(0x00000000));
+        SetBkColor(hdc, COLORREF(0x00604030));
         for (i, line) in lines.iter().enumerate() {
             let text: Vec<u16> = line.encode_utf16().collect();
             _ = TextOutW(hdc, 8, 8 + 18 * i as i32, &text);
         }
-        for br in [a, b, border] {
+        for br in [bg, border] {
             _ = DeleteObject(HGDIOBJ(br.0));
         }
         _ = EndPaint(hwnd, &ps);
@@ -356,7 +558,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_pos_changed(hwnd);
             return res;
         }
-        WM_TIMER if wparam.0 == TIMER_ID => on_late_frame(hwnd),
+        WM_TIMER if (T_REVERT..=T_LATE).contains(&wparam.0) => fire(hwnd, wparam.0),
         WM_PAINT => on_paint(hwnd),
         WM_CLOSE => log("WM_CLOSE"),
         WM_DESTROY => {
@@ -372,12 +574,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 fn main() {
     let c = cfg();
-    let style = match c.mode {
-        Mode::Normal | Mode::LateFrame => WS_OVERLAPPEDWINDOW,
-        _ => WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-    } | WS_VISIBLE;
-    let (w, h) = outer_size(c.client, style.0, 0);
-    let title: Vec<u16> = c.title.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: process-wide setting; must precede the first window of the process.
+    unsafe {
+        SetProcessDpiAwarenessContext(if c.dpi_aware {
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        } else {
+            DPI_AWARENESS_CONTEXT_UNAWARE
+        })
+        .expect("SetProcessDpiAwarenessContext failed");
+    }
+    let style = WS_VISIBLE
+        | match c.style {
+            Style::Frame => WS_OVERLAPPEDWINDOW,
+            Style::Fixed => {
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPSIBLINGS
+            }
+            Style::Popup => WS_POPUP | WS_CLIPSIBLINGS,
+        };
+    // SAFETY: plain query.
+    let (w, h) = outer_size(c.client, style.0, 0, unsafe { GetDpiForSystem() });
+    let title = c
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Shatter TestWin [{}]", c.name));
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
 
     // SAFETY: plain Win32 setup on the main thread; pointers outlive the calls that use them.
     unsafe {
@@ -414,9 +634,11 @@ fn main() {
             s.saved_ex.set(ex);
             s.ready.set(true);
         });
+        let [flags1, flags2] = describe(c);
         log(&format!(
-            "created style=0x{st:08X} ex=0x{ex:08X} mode={}",
-            c.mode_name
+            "created style=0x{st:08X} ex=0x{ex:08X} dpi={} name={} {flags1} {flags2}",
+            GetDpiForWindow(hwnd),
+            c.name
         ));
 
         let mut msg = MSG::default();
