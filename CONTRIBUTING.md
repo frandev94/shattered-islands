@@ -38,7 +38,7 @@ Before a PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `
 session probe (`examples/session_probe.rs`). If the probe reports no usable desktop, the job fails before the
 suites. Otherwise it runs the e2e, `mcp`/`cli` and `ipc::pipe` suites twice each with `--test-threads=1`,
 and the release `mcp` suite once. It runs on pull requests that touch `src/**`, `tests/**`, `examples/**`,
-`locales/**`, `.cargo/**`, `Cargo.toml`, `Cargo.lock` or `rust-toolchain.toml`, and on demand:
+`locales/**`, `.cargo/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` or `.github/workflows/e2e.yml`, and on demand:
 
 ```text
 gh workflow run e2e.yml --ref <branch>
