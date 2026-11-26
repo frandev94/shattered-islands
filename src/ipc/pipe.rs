@@ -227,10 +227,16 @@ async fn read_line<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> io:
 // ------------------------------------------------------------------- server
 
 fn salvage_id(line: &[u8]) -> Id {
-    serde_json::from_slice::<Value>(line)
-        .ok()
-        .and_then(|v| serde_json::from_value(v.get("id")?.clone()).ok())
-        .unwrap_or(Id::Num(0))
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        id: Id,
+    }
+    // Objects only: the derived decoder would read `[5]` as id 5. A repeated `id` fails as
+    // "duplicate field" and falls back to 0 rather than picking one.
+    if line.trim_ascii_start().first() != Some(&b'{') {
+        return Id::Num(0);
+    }
+    serde_json::from_slice::<Envelope>(line).map_or(Id::Num(0), |e| e.id)
 }
 
 fn encode_or_internal(resp: Response) -> String {
@@ -619,6 +625,8 @@ mod tests {
             input.push_str("{\"id\":9}\n");
             input.push_str(&"a".repeat(MAX_LINE + 5));
             input.push('\n');
+            input.push_str("{\"id\":3,\"id\":4,\"method\":\"m\"}\n");
+            input.push_str("{\"id\":8,\"method\":\"m\",\"params\":{\"a\":1,\"a\":2}}\n");
             input.push_str("{\"id\":2,\"method\":\"last\"}\n");
             wr.write_all(input.as_bytes()).await.expect("write");
             wr.shutdown().await.expect("shutdown");
@@ -629,7 +637,7 @@ mod tests {
                 .lines()
                 .map(|l| serde_json::from_str(l).expect("json"))
                 .collect();
-            assert_eq!(v.len(), 6);
+            assert_eq!(v.len(), 8);
             assert_eq!(
                 v[0],
                 json!({"id": 1, "result": {"method": "hello", "params": {"a": 1}}})
@@ -642,7 +650,11 @@ mod tests {
             assert_eq!(v[3]["id"], 9); // id salvaged from a malformed request
             assert_eq!(v[3]["error"]["code"], "invalid_params");
             assert_eq!(v[4]["error"]["code"], "invalid_json");
-            assert_eq!(v[5]["id"], 2);
+            assert_eq!(v[5]["id"], 0); // a repeated id is not salvaged
+            assert_eq!(v[5]["error"]["code"], "invalid_params");
+            assert_eq!(v[6]["id"], 8); // a nested repeated key keeps the request id
+            assert_eq!(v[6]["error"]["code"], "invalid_params");
+            assert_eq!(v[7]["id"], 2);
         });
     }
 
