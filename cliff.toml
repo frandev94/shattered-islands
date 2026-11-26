@@ -1,4 +1,6 @@
 # git-cliff: the default config (`git cliff --init`, 2.14.2) except the [bump] block and one skip rule.
+# Which commits cut a release at all is decided by the Gate step of release.yml (feat, fix, perf or breaking),
+# not here: git-cliff alone bumps the patch for any conventional commit.
 # On 0.x a breaking change bumps the minor and anything else the patch (CONTRIBUTING.md#releases).
 # Rather than regenerating the whole file with `-o`, the release workflow runs
 # `git cliff --unreleased --tag vX.Y.Z --prepend CHANGELOG.md`: only the new section goes under `header`,
