@@ -22,14 +22,62 @@ cargo deny check licenses                  # licence policy in deny.toml
 cargo build --examples && cargo e2e        # end-to-end suite (alias in .cargo/config.toml)
 ```
 
-**The e2e suite (and the `--ignored` `mcp`, `cli` and `ipc::pipe` tests) opens real windows and starts real
-resident processes on your desktop.** Close your own games and apps' dialogs first, run it single-threaded
-(the alias does) and do not touch the keyboard or mouse while it runs. Each case uses an isolated instance
-(`BORDERLESS_SHATTER_INSTANCE`, 1 to 32 characters of `A-Za-z0-9-`; an invalid value is refused with exit code 1, or 2 for the CLI; the resident and GUI print `fatal:` to stderr, which is invisible unless started from a console) and a temporary profile directory, and only touches windows it created. CI never
-runs ignored tests. The tiers and what each needs are listed in `AGENTS.md`, "Testing & QA".
+**The e2e suite and the `--ignored` `mcp` and `cli` tests open real windows and start real resident processes on
+your desktop.** Close your own games and dialogs first, run them with `--test-threads=1` (the `cargo e2e` alias
+does), and do not touch the keyboard or mouse while they run. Each case gets its own instance
+(`BORDERLESS_SHATTER_INSTANCE`), and its child processes get a temporary `APPDATA` and `LOCALAPPDATA` under
+`target\e2e-tmp`. The `--ignored` `ipc::pipe` test opens no window, but it binds the real pipe name, so close any
+running resident before it. The tiers and what each needs are listed in `AGENTS.md`, "Testing & QA".
 
 Before a PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and
 `cargo deny check licenses` must pass; these are the checks CI runs (`.github/workflows/test.yml`).
+
+## e2e on GitHub Actions
+
+`.github/workflows/e2e.yml` (workflow `e2e`) runs on `windows-latest`. It runs the property suite, then a
+session probe (`examples/session_probe.rs`). If the probe reports no usable desktop, the job fails before the
+suites. Otherwise it runs the e2e, `mcp`/`cli` and `ipc::pipe` suites twice each with `--test-threads=1`,
+and the release `mcp` suite once. It runs on pull requests that touch `src/**`, `tests/**`, `examples/**`,
+`locales/**`, `.cargo/**`, `Cargo.toml`, `Cargo.lock` or `rust-toolchain.toml`, and on demand:
+
+```text
+gh workflow run e2e.yml --ref <branch>
+```
+
+On-demand runs need the workflow file on `main`. If `gh` refuses the branch, use the run of the pull request
+or run the workflow on `main` after the merge.
+
+The run summary (`$GITHUB_STEP_SUMMARY`, shown on the run page) has three tables: the probe result, passed and
+failed per suite and run, and the hygiene checks after each suite. The full logs are in the `e2e-logs`
+artifact, kept for 14 days.
+
+## Local fallback
+
+Use this on your own desktop when the hosted run is not usable, or to check a change before the workflow runs.
+It opens real windows on your desktop, so run it only with the owner's go-ahead. Run the commands from the
+repository root, in this order (PowerShell):
+
+```text
+cargo build --all-targets
+cargo test --test properties                                     # run twice; same passed count
+$env:PROPTEST_CASES = 2000; cargo test --test properties; Remove-Item Env:PROPTEST_CASES
+cargo e2e                                                        # run twice
+cargo test --test mcp --test cli -- --ignored --test-threads=1   # run twice
+cargo test --lib ipc::pipe -- --ignored --test-threads=1         # run twice
+cargo build --release --examples
+cargo test --release --test mcp -- --ignored --test-threads=1
+```
+
+Checklist:
+
+- Before the first run, quit the resident from the tray menu, close any game or app dialog that could take focus,
+  and do not touch the keyboard or mouse until the run finishes.
+- Before the first run, record the `borderless-shatter.exe` PIDs (`tasklist /FI "IMAGENAME eq borderless-shatter.exe"`)
+  and the state of `%APPDATA%\BorderlessShatter`: absent, or the SHA-256 of each file
+  (`Get-ChildItem "$env:APPDATA\BorderlessShatter" -File | Get-FileHash`).
+- After each run, check that `tasklist /FI "IMAGENAME eq testwin.exe"` finds no process, the
+  `borderless-shatter.exe` PIDs are the recorded ones, `target\e2e-tmp` is empty or absent, and
+  `%APPDATA%\BorderlessShatter` is still absent or its hashes are unchanged.
 
 ## Code rules
 
