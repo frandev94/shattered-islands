@@ -7,19 +7,27 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow,
+    MONITORINFOEXW, MonitorFromRect, MonitorFromWindow,
 };
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    CreateMutexW, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows::Win32::UI::HiDpi::{
+    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+    GetAwarenessFromDpiAwarenessContext, GetDpiForMonitor, GetDpiForWindow,
+    GetWindowDpiAwarenessContext, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, EnumWindows, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GetAncestor,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_MESSAGE, HWND_TOP, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, KillTimer, PostMessageW, RegisterClassW,
-    SET_WINDOW_POS_FLAGS, SW_MAXIMIZE, SW_RESTORE, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    GetClassNameW, GetClientRect, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_MESSAGE, HWND_TOP, IsIconic, IsWindow, IsWindowVisible,
+    IsZoomed, KillTimer, MONITORINFOF_PRIMARY, PostMessageW, RegisterClassW, SET_WINDOW_POS_FLAGS,
+    SW_MAXIMIZE, SW_RESTORE, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 use windows::core::{BOOL, PWSTR, w};
 
@@ -200,13 +208,14 @@ pub fn monitor_rect_of(h: HWND) -> Result<Rect> {
 }
 
 unsafe extern "system" fn collect_monitor(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
-    // SAFETY: `data` is the `&mut Vec<HMONITOR>` passed by `monitor_rects`, alive during enumeration.
+    // SAFETY: `data` is the `&mut Vec<HMONITOR>` passed by `monitors`, alive during enumeration.
     let list = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
     list.push(m);
     BOOL(1)
 }
 
-pub fn monitor_rects() -> Result<Vec<Rect>> {
+/// Monitors in `EnumDisplayMonitors` order with GDI device name, primary flag and effective DPI.
+pub fn monitors() -> Result<Vec<crate::islands::MonitorInfo>> {
     let mut handles: Vec<HMONITOR> = Vec::new();
     // SAFETY: the pointer outlives the synchronous enumeration and matches the callback's cast.
     let ok = unsafe {
@@ -223,7 +232,154 @@ pub fn monitor_rects() -> Result<Vec<Rect>> {
             windows::core::Error::from_thread(),
         ));
     }
-    handles.into_iter().map(monitor_rect).collect()
+    handles
+        .into_iter()
+        .enumerate()
+        .map(|(index, m)| {
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            // SAFETY: MONITORINFOEXW starts with a MONITORINFO and cbSize announces the larger struct.
+            let ok =
+                unsafe { GetMonitorInfoW(m, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) };
+            if !ok.as_bool() {
+                return Err(call_err(
+                    "GetMonitorInfoW",
+                    windows::core::Error::from_thread(),
+                ));
+            }
+            let name_len = info
+                .szDevice
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.szDevice.len());
+            let dpi = monitor_dpi(m);
+            Ok(crate::islands::MonitorInfo {
+                index,
+                device: String::from_utf16_lossy(&info.szDevice[..name_len]),
+                rect: from_native(info.monitorInfo.rcMonitor),
+                dpi,
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            })
+        })
+        .collect()
+}
+
+/// Effective DPI of monitor `m`; 96 (100 %) if it cannot be read.
+fn monitor_dpi(m: HMONITOR) -> u32 {
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    // SAFETY: both out pointers are valid for the call.
+    match unsafe { GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) } {
+        Ok(()) if dpi_x != 0 => dpi_x,
+        _ => 96,
+    }
+}
+
+/// Effective DPI of the monitor that holds most of `r` (the nearest one if none does). Unlike
+/// [`dpi_of`], this is the real scale even for a DPI-unaware window, whose own DPI reads 96.
+pub fn monitor_dpi_at(r: Rect) -> u32 {
+    let native = RECT {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+    };
+    // SAFETY: `native` is a valid RECT for the call; DEFAULTTONEAREST always returns a monitor.
+    monitor_dpi(unsafe { MonitorFromRect(&native, MONITOR_DEFAULTTONEAREST) })
+}
+
+/// Process id that owns window `h` (0 if the window is gone).
+pub fn window_pid(h: HWND) -> u32 {
+    let mut pid = 0u32;
+    // SAFETY: `pid` is a valid out pointer.
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    pid
+}
+
+/// Reads a UTF-16 string through `read` (title/class getters); empty on failure.
+fn read_text(read: impl FnOnce(&mut [u16]) -> i32) -> String {
+    let mut units = vec![0u16; 512];
+    let n = read(&mut units).clamp(0, units.len() as i32) as usize;
+    String::from_utf16_lossy(&units[..n])
+}
+
+pub fn window_title(h: HWND) -> String {
+    // SAFETY: the buffer is writable for its whole length during the call.
+    read_text(|buf| unsafe { GetWindowTextW(h, buf) })
+}
+
+pub fn window_class(h: HWND) -> String {
+    // SAFETY: the buffer is writable for its whole length during the call.
+    read_text(|buf| unsafe { GetClassNameW(h, buf) })
+}
+
+/// Client area size in physical pixels.
+pub fn client_size(h: HWND) -> Result<(i32, i32)> {
+    let mut r = RECT::default();
+    // SAFETY: `r` is a valid out pointer.
+    unsafe { GetClientRect(h, &mut r) }.map_err(|e| call_err("GetClientRect", e))?;
+    Ok((r.right - r.left, r.bottom - r.top))
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DpiAwareness {
+    Unaware,
+    System,
+    PerMonitor,
+    PerMonitorV2,
+    Unknown,
+}
+
+pub fn dpi_awareness_of(h: HWND) -> DpiAwareness {
+    // SAFETY: plain FFI calls with by-value arguments; a null context yields INVALID/Unknown.
+    unsafe {
+        let ctx = GetWindowDpiAwarenessContext(h);
+        if ctx.0.is_null() {
+            return DpiAwareness::Unknown;
+        }
+        if AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).as_bool() {
+            return DpiAwareness::PerMonitorV2;
+        }
+        match GetAwarenessFromDpiAwarenessContext(ctx) {
+            a if a == DPI_AWARENESS_UNAWARE => DpiAwareness::Unaware,
+            a if a == DPI_AWARENESS_SYSTEM_AWARE => DpiAwareness::System,
+            a if a == DPI_AWARENESS_PER_MONITOR_AWARE => DpiAwareness::PerMonitor,
+            _ => DpiAwareness::Unknown,
+        }
+    }
+}
+
+/// DPI of the window (0 if the window is invalid).
+pub fn dpi_of(h: HWND) -> u32 {
+    // SAFETY: plain FFI call with a by-value argument.
+    unsafe { GetDpiForWindow(h) }
+}
+
+/// Whether process `pid` runs elevated; `None` if its token cannot be queried.
+pub fn is_elevated(pid: u32) -> Option<bool> {
+    // SAFETY: plain FFI call; the guard closes the handle.
+    let process =
+        OwnedHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+    let mut token = HANDLE::default();
+    // SAFETY: `token` is a valid out pointer; the guard below closes it.
+    unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }.ok()?;
+    let token = OwnedHandle(token);
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: the buffer is a TOKEN_ELEVATION of the announced size.
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut core::ffi::c_void),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    }
+    .ok()?;
+    Some(elevation.TokenIsElevated != 0)
 }
 
 /// Closes the wrapped kernel handle on drop.
@@ -325,8 +481,13 @@ pub fn def_window_proc(h: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRE
 
 /// Queues `msg` on the window's own thread; unlike a thread message it is never lost in modal loops.
 pub fn post_message(h: HWND, msg: u32, wparam: usize) -> Result<()> {
+    post_message_lparam(h, msg, wparam, 0)
+}
+
+/// Like `post_message` but also carries an `lparam`.
+pub fn post_message_lparam(h: HWND, msg: u32, wparam: usize, lparam: isize) -> Result<()> {
     // SAFETY: plain FFI call with by-value arguments.
-    unsafe { PostMessageW(Some(h), msg, WPARAM(wparam), LPARAM(0)) }
+    unsafe { PostMessageW(Some(h), msg, WPARAM(wparam), LPARAM(lparam)) }
         .map_err(|e| call_err("PostMessageW", e))
 }
 
@@ -344,11 +505,19 @@ pub fn kill_timer(h: HWND, id: usize) {
     let _ = unsafe { KillTimer(Some(h), id) };
 }
 
-/// Takes the per-user single-instance mutex. `Ok(None)` means another instance already holds it;
+/// Takes the per-user single-instance mutex of instance `suffix` (already validated, see
+/// [`crate::ipc::pipe::instance_suffix`]). `Ok(None)` means another instance already holds it;
 /// otherwise keep the returned guard alive for the whole process.
-pub fn acquire_single_instance() -> Result<Option<OwnedHandle>> {
-    // SAFETY: the name is a static literal; default security attributes.
-    let mutex = unsafe { CreateMutexW(None, false, w!("Local\\BorderlessShatter.SingleInstance")) }
+pub fn acquire_single_instance(suffix: Option<&str>) -> Result<Option<OwnedHandle>> {
+    let name: Vec<u16> = match suffix {
+        Some(s) => format!("Local\\BorderlessShatter.SingleInstance.{s}"),
+        None => "Local\\BorderlessShatter.SingleInstance".to_owned(),
+    }
+    .encode_utf16()
+    .chain([0])
+    .collect();
+    // SAFETY: `name` is NUL-terminated and outlives the call; default security attributes.
+    let mutex = unsafe { CreateMutexW(None, false, windows::core::PCWSTR(name.as_ptr())) }
         .map_err(|e| call_err("CreateMutexW", e))?;
     let guard = OwnedHandle(mutex);
     // SAFETY: read straight after CreateMutexW, before any other call can overwrite it.
