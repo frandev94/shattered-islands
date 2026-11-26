@@ -22,9 +22,10 @@ use crate::diagnose::{self, Sample, Sampler, WriteMark};
 use crate::guard::{self, Action, Decision, Guard, GuardConfig, Observation, SkipReason};
 use crate::ipc::{
     self, ApplyParams, ApplyResult, ClientSize, DiagnoseParams, DiagnoseResult, ErrorBody,
-    ErrorCode, GetProfilesResult, HelloResult, Id, IslandInfo, LayoutInfo, ListIslandsResult,
-    ListWindowsParams, ListWindowsResult, MAX_DELAY_MS, PENDING_GRACE_MS, PlaceParams, Request,
-    Response, RestoreAllResult, RestoreFailure, RestoreParams, RestoreResult, SetProfilesParams,
+    ErrorCode, GetProfilesParams, GetProfilesResult, HelloParams, HelloResult, Id, IslandInfo,
+    LayoutInfo, ListIslandsParams, ListIslandsResult, ListWindowsParams, ListWindowsResult,
+    MAX_DELAY_MS, PENDING_GRACE_MS, PlaceParams, Request, Response, RestoreAllParams,
+    RestoreAllResult, RestoreFailure, RestoreParams, RestoreResult, SetProfilesParams,
     SetProfilesResult, TimelineEntry, TimelineSource, WindowInfo, WindowMonitor, WindowRef,
 };
 use crate::islands::{self, IslandError, Layout, MonitorSel, Size};
@@ -1660,7 +1661,10 @@ impl Engine {
         let Request { id, method, params } = req;
         let reply = Reply { id, tx };
         match method.as_str() {
-            "hello" => reply.send(Ok(self.hello())),
+            "hello" => match ipc::parse_params::<HelloParams>(params) {
+                Ok(_) => reply.send(Ok(self.hello())),
+                Err(e) => reply.fail(e),
+            },
             "list_windows" => {
                 reply.send(ipc::parse_params(params).and_then(|p| self.list_windows(&p)))
             }
@@ -1695,9 +1699,18 @@ impl Engine {
             "restore" => {
                 reply.send(ipc::parse_params(params).and_then(|p| self.restore_request(&p)))
             }
-            "restore_all" => reply.send(Ok(self.restore_everything())),
-            "list_islands" => reply.send(self.list_islands()),
-            "get_profiles" => reply.send(self.get_profiles()),
+            "restore_all" => match ipc::parse_params::<RestoreAllParams>(params) {
+                Ok(_) => reply.send(Ok(self.restore_everything())),
+                Err(e) => reply.fail(e),
+            },
+            "list_islands" => match ipc::parse_params::<ListIslandsParams>(params) {
+                Ok(_) => reply.send(self.list_islands()),
+                Err(e) => reply.fail(e),
+            },
+            "get_profiles" => match ipc::parse_params::<GetProfilesParams>(params) {
+                Ok(_) => reply.send(self.get_profiles()),
+                Err(e) => reply.fail(e),
+            },
             "set_profiles" => {
                 reply.send(ipc::parse_params(params).and_then(|p| self.set_profiles(p)))
             }
@@ -2312,6 +2325,42 @@ mod tests {
         assert_eq!(store.load().unwrap(), [entry(3)]);
         assert!(!dir.join("state.json.bad").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Runs one request through `handle_ipc` and returns the reply.
+    fn ipc_reply(e: &mut Engine, method: &str, params: Value) -> Response {
+        let (tx, mut rx) = oneshot::channel();
+        e.handle_ipc(
+            Request {
+                id: Id::Num(1),
+                method: method.into(),
+                params,
+            },
+            tx,
+        );
+        rx.try_recv().expect("reply sent synchronously")
+    }
+
+    #[test]
+    fn paramless_methods_reject_non_object_params() {
+        let mut e = bare_engine();
+        for method in ["hello", "restore_all", "list_islands", "get_profiles"] {
+            for params in [json!([1, [2]]), json!([]), json!(5), json!("x")] {
+                let resp = ipc_reply(&mut e, method, params.clone());
+                let body = resp
+                    .error
+                    .unwrap_or_else(|| panic!("{method} {params} accepted"));
+                assert_eq!(body.code, ErrorCode::InvalidParams, "{method} {params}");
+            }
+        }
+    }
+
+    #[test]
+    fn hello_accepts_null_and_object_params() {
+        let mut e = bare_engine();
+        for params in [Value::Null, json!({}), json!({"extra": [1]})] {
+            assert!(ipc_reply(&mut e, "hello", params).error.is_none());
+        }
     }
 
     /// An engine with no store, profiles or timer, for logic that only needs `managed`.

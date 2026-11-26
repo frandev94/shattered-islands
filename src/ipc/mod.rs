@@ -344,7 +344,12 @@ impl<'de> Visitor<'de> for UniqueKeys {
         let mut seen = HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if seen.contains(&key) {
-                return Err(de::Error::custom(format_args!("duplicate key {key:?}")));
+                // A repeated key can be huge; keep the reply well under the line limit.
+                let shown: String = key.chars().take(64).collect();
+                let more = if shown.len() < key.len() { "…" } else { "" };
+                return Err(de::Error::custom(format_args!(
+                    "duplicate key {shown:?}{more}"
+                )));
             }
             map.next_value::<UniqueKeys>()?;
             seen.insert(key);
@@ -1076,6 +1081,117 @@ mod tests {
             decode_request(r#"{"id":1,"method":"m","params":{"a":{"a":1},"b":[{"a":1},{"a":2}]}}"#)
                 .expect("distinct keys");
         assert_eq!(r.params["b"][1]["a"], 2);
+    }
+
+    #[test]
+    fn paramless_methods_take_null_or_an_object() {
+        fn check<T: DeserializeOwned + JsonSchema + std::fmt::Debug>() {
+            accepted::<T>(Value::Null);
+            accepted::<T>(json!({}));
+            accepted::<T>(json!({"extra": [1]}));
+            assert_eq!(
+                parse_params::<T>(json!([1, [2]])).expect_err("array").code,
+                ErrorCode::InvalidParams
+            );
+        }
+        check::<HelloParams>();
+        check::<RestoreAllParams>();
+        check::<ListIslandsParams>();
+        check::<GetProfilesParams>();
+    }
+
+    #[test]
+    fn huge_duplicate_key_yields_a_short_invalid_params() {
+        let key = "k".repeat(400_000);
+        let line = format!(r#"{{"id":1,"method":"m","params":{{"{key}":1,"{key}":2}}}}"#);
+        let e = decode_request(&line).expect_err("duplicate");
+        assert_eq!(e.code, ErrorCode::InvalidParams);
+        assert!(e.message.len() < 200, "{} bytes", e.message.len());
+        assert!(e.message.contains("duplicate key"), "{}", e.message);
+    }
+
+    /// Keywords the array walk reads (`schema_leaves`, `admits`, `walk_schema`).
+    const WALKED: &[&str] = &[
+        "$ref",
+        "anyOf",
+        "oneOf",
+        "type",
+        "const",
+        "enum",
+        "properties",
+        "items",
+        "additionalProperties",
+    ];
+    /// Keywords that only describe or bound scalars and cannot change where an array is allowed.
+    const INERT: &[&str] = &[
+        "$schema",
+        "$defs",
+        "title",
+        "description",
+        "required",
+        "default",
+        "format",
+        "minimum",
+        "maximum",
+    ];
+
+    /// Every schema keyword in `s` (a schema, not a value), recursing through subschemas.
+    fn keywords(s: &Value, out: &mut std::collections::BTreeSet<String>) {
+        let Value::Object(o) = s else { return };
+        for (k, v) in o {
+            out.insert(k.clone());
+            match k.as_str() {
+                "properties" | "$defs" | "definitions" | "patternProperties" => {
+                    v.as_object()
+                        .into_iter()
+                        .flatten()
+                        .for_each(|(_, v)| keywords(v, out));
+                }
+                "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
+                    v.as_array()
+                        .into_iter()
+                        .flatten()
+                        .for_each(|v| keywords(v, out));
+                }
+                "items" | "additionalProperties" | "not" | "if" | "then" | "else" => {
+                    keywords(v, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect<T: JsonSchema>(out: &mut std::collections::BTreeSet<String>) {
+        keywords(
+            SchemaGenerator::default()
+                .into_root_schema_for::<T>()
+                .as_value(),
+            out,
+        );
+    }
+
+    #[test]
+    fn every_params_schema_keyword_is_known_to_the_walk() {
+        let mut found = std::collections::BTreeSet::new();
+        collect::<HelloParams>(&mut found);
+        collect::<ListWindowsParams>(&mut found);
+        collect::<ApplyParams>(&mut found);
+        collect::<PlaceParams>(&mut found);
+        collect::<RestoreParams>(&mut found);
+        collect::<RestoreAllParams>(&mut found);
+        collect::<ListIslandsParams>(&mut found);
+        collect::<GetProfilesParams>(&mut found);
+        collect::<SetProfilesParams>(&mut found);
+        collect::<DiagnoseParams>(&mut found);
+        let unknown: Vec<&String> = found
+            .iter()
+            .filter(|k| !WALKED.contains(&k.as_str()) && !INERT.contains(&k.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "schema keyword(s) {unknown:?} are new: the array walk (`walk_schema`/`schema_leaves`) \
+             must learn them, then add them to WALKED (or INERT if they cannot admit an array)"
+        );
     }
 
     #[test]
