@@ -27,6 +27,7 @@ use borderless_shatter::ipc::{
 };
 use borderless_shatter::islands::MonitorSel;
 use borderless_shatter::profiles::Warning;
+use borderless_shatter::state_store::StateStore;
 use borderless_shatter::win32::DpiAwareness;
 use borderless_shatter::window_state::Rect;
 use common::*;
@@ -1146,4 +1147,132 @@ fn legacy_preset_ids_resolve() {
 
     expect_restored(&mut c, &w);
     assert_eq!(fs::read(h.profiles_path()).expect("profiles.json"), before);
+}
+
+/// Places a `NOTEPAD` testwin on `RIGHT`, kills the resident, rewrites that entry's island in
+/// `state.<suffix>.json` to `island`, then restarts the resident and waits for the re-adoption.
+fn readopt_with_island(test: &str, island: &str) -> (Harness, Client, TestWin) {
+    let mut h = Harness::new(test);
+    let mut c = h.start_resident();
+    let w = h.testwin(NOTEPAD);
+    assert!(
+        place(&mut c, w.hwnd, RIGHT).applied,
+        "setup: the initial place must apply"
+    );
+    drop(c);
+    h.kill_resident();
+
+    let store = StateStore::open(h.state_path());
+    let mut entries = store.load().expect("state.json after the crash");
+    let e = entries
+        .iter_mut()
+        .find(|e| e.hwnd == w.hwnd)
+        .expect("the placed window is in state.json");
+    e.island = Some(island.into());
+    store.save(&entries).expect("rewrite state.json");
+    assert_eq!(
+        stored_island(&h, w.hwnd).as_deref(),
+        Some(island),
+        "setup: the seeded island must be on disk before the restart"
+    );
+
+    let mut c = h.start_resident();
+    wait_until("window re-adopted", Duration::from_secs(5), || {
+        managed_hwnds(&mut c).contains(&w.hwnd)
+    });
+    (h, c, w)
+}
+
+/// The `island` `state.<suffix>.json` currently holds for `hwnd`.
+fn stored_island(h: &Harness, hwnd: isize) -> Option<String> {
+    StateStore::open(h.state_path())
+        .load()
+        .ok()?
+        .into_iter()
+        .find(|e| e.hwnd == hwnd)?
+        .island
+}
+
+/// The occupants of every island of every layout, as `layout/island` -> hwnds.
+fn occupants_of(c: &mut Client) -> Vec<(String, Vec<isize>)> {
+    list_islands(c)
+        .layouts
+        .into_iter()
+        .flat_map(|l| {
+            l.islands
+                .into_iter()
+                .map(move |i| (format!("{}/{}", l.id, i.id), i.occupants))
+        })
+        .collect()
+}
+
+/// Creates real windows (resident killed and restarted + testwin); see module docs.
+///
+/// A `state.json` written before the preset rename holds a legacy island ref: re-adoption
+/// reports and persists the canonical one, and the window still counts as an island occupant.
+#[test]
+#[ignore = "creates real windows; see module docs"]
+fn readoption_canonicalizes_legacy_island() {
+    const LEGACY: &str = "mitades-16-9/derecha"; // readoption_canonicalizes_legacy_island
+    let (h, mut c, w) = readopt_with_island("readoption_canonicalizes_legacy_island", LEGACY);
+
+    let info = windows(&mut c, true)
+        .into_iter()
+        .find(|i| i.hwnd == w.hwnd)
+        .expect("managed");
+    assert_eq!(
+        info.island.as_deref(),
+        Some(RIGHT),
+        "readopt must canonicalize the legacy ref, list_windows reported it as stored"
+    );
+    for (island, occupants) in occupants_of(&mut c) {
+        let expected: &[isize] = if island == RIGHT { &[w.hwnd] } else { &[] };
+        assert_eq!(
+            occupants, expected,
+            "island {island}: the re-adopted window must occupy only {RIGHT}"
+        );
+    }
+    wait_until(
+        "state.json rewritten with the canonical island",
+        Duration::from_secs(5),
+        || stored_island(&h, w.hwnd).as_deref() == Some(RIGHT),
+    );
+    expect_restored(&mut c, &w);
+}
+
+/// Creates real windows (resident killed and restarted + testwin); see module docs.
+///
+/// An island ref that resolves to nothing is kept verbatim across re-adoption (the window is
+/// still restorable) and occupies no island.
+#[test]
+#[ignore = "creates real windows; see module docs"]
+fn readoption_keeps_unresolvable_island() {
+    const GONE: &str = "gone/x";
+    let (h, mut c, w) = readopt_with_island("readoption_keeps_unresolvable_island", GONE);
+
+    let info = windows(&mut c, true)
+        .into_iter()
+        .find(|i| i.hwnd == w.hwnd)
+        .expect("managed");
+    assert_eq!(
+        info.island.as_deref(),
+        Some(GONE),
+        "readopt must keep an unresolvable ref instead of dropping it"
+    );
+    for (island, occupants) in occupants_of(&mut c) {
+        assert!(
+            !occupants.contains(&w.hwnd),
+            "island {island}: an unresolvable ref must not make the window an occupant"
+        );
+    }
+    // `persist` ran in `startup`; give it time, then it must still hold the ref.
+    wait_until("state.json to be readable", Duration::from_secs(5), || {
+        stored_island(&h, w.hwnd).is_some()
+    });
+    assert_eq!(
+        stored_island(&h, w.hwnd).as_deref(),
+        Some(GONE),
+        "persist after readopt must keep the unresolvable ref in state.json"
+    );
+    expect_restored(&mut c, &w);
 }
