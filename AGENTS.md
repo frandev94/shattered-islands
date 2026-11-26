@@ -63,15 +63,17 @@ borderless-shatter.exe list-windows        # CLI; see `borderless-shatter help` 
 
 ## Testing & QA
 
-Tiers, fastest first. The first two need no desktop session; the rest create real windows or resident processes.
+Tiers, fastest first. Unit, property and pipe tiers need no desktop session; the rest create real windows or resident processes.
 
 | Tier | Command | Desktop | Covers |
 |---|---|---|---|
 | Unit | `cargo test --lib` | no | Pure logic in the crate's `#[cfg(test)]` modules: style and rect math, profile parsing and matching. |
 | Property | `cargo test --test properties` | no | Invariants over generated inputs (proptest). |
 | Process | `cargo test --test mcp -- --ignored --test-threads=1`, `cargo test --test cli -- --ignored --test-threads=1` | yes | `mcp` and `cli` against an isolated resident. |
-| Pipe | `cargo test --lib ipc::pipe -- --ignored` | yes | The named pipe against a real server. |
+| Pipe | `cargo test --lib ipc::pipe -- --ignored --test-threads=1` | no | The named pipe against a real server. Needs no resident running. |
 | End-to-end | `cargo build --examples && cargo test --test e2e -- --ignored --test-threads=1` | yes | A real resident and fake game windows, measured with Win32. |
+
+CI: `.github/workflows/e2e.yml` runs, on `windows-latest`, the property tier first (even if the probe fails), then a session probe, then the window suites (process, pipe, end-to-end); the window suites run twice, and the release `mcp` run once. See CONTRIBUTING.md, "e2e on GitHub Actions".
 
 - `cargo e2e` is an alias for the end-to-end run (`.cargo/config.toml`). Build the examples first: the fake game is an example binary.
 - nextest is optional (`.config/nextest.toml`). It runs the `e2e`, `mcp` and `cli` binaries one at a time, with a 60 s timeout per period that terminates after three periods. Doctests are not run by nextest; use `cargo test --doc`.
