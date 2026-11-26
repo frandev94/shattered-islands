@@ -67,8 +67,10 @@ Releases are automatic. A push to `main` that touches `src/**`, `locales/**`, `C
 runs `.github/workflows/release.yml`: tests, then a build that picks the next version from the Conventional
 Commits (`git-cliff`, `cliff.toml`), updates `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md`, builds
 `borderless-shatter.exe --release --locked`, and a publish job that commits `chore(release): vX.Y.Z`, tags it
-and creates the GitHub release with the exe and its `.sha256`. Docs-only and test-only merges release nothing;
-the next release includes them. Do not edit the generated `CHANGELOG.md` sections or tag by hand.
+and creates the GitHub release with the exe and its `.sha256`. A release is cut only when the commits since
+the last tag include a `feat`, `fix`, `perf` or a breaking change (`!` after the type or scope, or a
+`BREAKING CHANGE:` footer); `docs`, `chore`, `test`, `ci`, `build`, `refactor` and `style` accumulate and
+appear in the changelog of the next release. When none qualifies the run ends green with a notice. Do not edit the generated `CHANGELOG.md` sections or tag by hand.
 `CHANGELOG.md` must start with the `header` of `cliff.toml` (CI checks it); change both together.
 
 ## Clean-room and licence
