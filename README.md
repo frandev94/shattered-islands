@@ -32,7 +32,9 @@ flowchart LR
     resident -->|"places and restores"| windows["Game and app windows"]
     resident <-->|"reads and writes"| data["profiles.json and state.json"]
     panel -->|"writes"| settings["settings.json"]
-    settings -->|"read for the language (resident, panel, CLI)"| resident
+    settings -.->|"read for the language"| resident
+    settings -.->|"read for the language"| panel
+    settings -.->|"read for the language"| cli
 ```
 
 ## Status
