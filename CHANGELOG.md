@@ -2,6 +2,26 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - 2026-11-26
+
+### 🐛 Bug Fixes
+
+- *(profiles)* Keep unknown fields of layouts and islands
+
+### 📚 Documentation
+
+- Move design docs out of the repo
+- Add IPC protocol and design constraints to the architecture guide
+- Organize game results by engine and use case
+- Describe kept unknown fields and replace_extras
+
+### 🚜 Refactor
+
+- Inline design reasons in comments
+
+### ⚙️ Miscellaneous Tasks
+
+- Release only when user-facing commits landed
 ## [0.2.1] - 2026-11-26
 
 ### 📚 Documentation
