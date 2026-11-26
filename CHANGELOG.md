@@ -2,6 +2,19 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-11-26
+
+### 📚 Documentation
+
+- Clean up design docs
+
+### 🧪 Testing
+
+- Use English strings in the notes filter test
+
+### ⚙️ Miscellaneous Tasks
+
+- Remove stray files
 ## [0.2.0] - 2026-11-26
 
 ### 🚀 Features
