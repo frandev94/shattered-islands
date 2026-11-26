@@ -48,7 +48,9 @@ pub enum Decision {
     Capture,
 }
 
-/// Entry decision, in the order of `docs/V0.2.md` "New guard".
+/// Entry decision: excluded or hidden windows are left alone; a managed window already at its
+/// target without a frame needs no write; anything else is captured, even a window that already
+/// has no frame (a game started with `-popupwindow` still needs placing).
 pub fn decide(
     excluded: bool,
     top_level_visible: bool,

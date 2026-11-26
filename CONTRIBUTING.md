@@ -58,8 +58,8 @@ Before a PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `
   change; while the version is 0.x that bumps the minor, anything else bumps the patch.
 - Never put a version number in a commit message or a branch name; versions come from the release tooling.
 - Open the PR against `main` with `Closes #<n>` in the description. Docs follow behaviour in the same PR:
-  update `README.md`, `CHANGELOG.md` and `docs/` when what the product does changes (they describe the
-  product, not how it was built).
+  update `README.md`, `ARCHITECTURE.md`, `docs/GAMES.md` and this file when what the product does changes
+  (they describe the product, not how it was built). `CHANGELOG.md` is generated; do not edit it.
 
 ## Releases
 

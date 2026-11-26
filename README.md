@@ -40,14 +40,14 @@ The executable ends up in `target\release\borderless-shatter.exe`. It weighs abo
 
 Use the release build for everyday work: it is a Windows-subsystem program. The debug build is a console program and opens a console window.
 
-The Windows manifest (asInvoker, PerMonitorV2, Common Controls and SegmentHeap) is provided by `gpui-pre` through `gpui-kit`; the project has no `build.rs` or `app.manifest` of its own (D-17).
+The Windows manifest (asInvoker, PerMonitorV2, Common Controls and SegmentHeap) is provided by `gpui-pre` through `gpui-kit`; the project has no `build.rs` or `app.manifest` of its own, because a second one collides with the embedded resource at link time.
 
 Tests: `cargo test` runs the unit, property and doc tests. The suites that open real windows are ignored by default; see [`CONTRIBUTING.md`](CONTRIBUTING.md) and the "Testing & QA" section of [`AGENTS.md`](AGENTS.md).
 
 ## Usage
 
 1. Run `borderless-shatter.exe`. The icon appears in the tray.
-2. Double-click the icon, or choose "Open panel", to open the panel (the subcommand `borderless-shatter gui`, a separate process that talks to the resident process through the named pipe, D-16). A left click on the icon does nothing; a right click opens the menu.
+2. Double-click the icon, or choose "Open panel", to open the panel (the subcommand `borderless-shatter gui`, a separate process that talks to the resident process through the named pipe). A left click on the icon does nothing; a right click opens the menu.
 3. Create or edit profiles in the panel, or in [`profiles.json`](#profiles) followed by "Reload profiles".
 4. When a window of a process with a profile opens, its frame is removed and it is fitted to its monitor or island.
 
@@ -266,7 +266,7 @@ The old `--mode` names (`normal`, `fixed`, `revert-style`, `force-size`, `warsca
 
 ## Roadmap
 
-Summary of [`docs/VISION.md`](docs/VISION.md): the goal is "islands", named rectangles on the monitor, to split a 32:9 screen into two 16:9 ones and place one game in each.
+The goal is "islands", named rectangles on the monitor, to split a 32:9 screen into two 16:9 ones and place one game in each.
 
 - **v0.1** (done): borderless at full monitor size, exact restore and tray.
 - **v0.2** (this version): islands in JSON (first preset: two 16:9 halves), windows that already have no frame, guard with re-assertions, IPC over a named pipe, GUI with GPUI, MCP server and CLI.
@@ -275,12 +275,7 @@ Summary of [`docs/VISION.md`](docs/VISION.md): the goal is "islands", named rect
 
 ## Documentation
 
-- [`docs/VISION.md`](docs/VISION.md): vision and islands.
-- [`docs/V0.2.md`](docs/V0.2.md): v0.2 specification.
-- [`docs/GUI.md`](docs/GUI.md): the panel.
-- [`docs/PROTOTYPE.md`](docs/PROTOTYPE.md): v0.1 specification.
-- [`docs/DECISIONS.md`](docs/DECISIONS.md): design decisions.
-- [`docs/GAMES.md`](docs/GAMES.md): results per game.
+- [`docs/GAMES.md`](docs/GAMES.md): results per game, by engine and use case.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): how the code is organised.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): building, testing and contributing.
 - [`CHANGELOG.md`](CHANGELOG.md): change history.

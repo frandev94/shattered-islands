@@ -1,4 +1,4 @@
-//! MCP server (`borderless-shatter mcp`, docs/V0.2.md "MCP"): one tool per IPC method, each
+//! MCP server (`borderless-shatter mcp`): one tool per IPC method, each
 //! forwarded unchanged to the resident over the named pipe. stdout carries only MCP messages;
 //! logs go to stderr. The resident is started on the first `tools/call` that finds no pipe.
 

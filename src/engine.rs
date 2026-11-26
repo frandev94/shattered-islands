@@ -119,7 +119,8 @@ fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
 }
 
-/// Maps a failed write to the protocol error; an access denial on an elevated target is UIPI (D-07).
+/// Maps a failed write to the protocol error; an access denial on an elevated target is UIPI
+/// (the resident runs `asInvoker`, so it cannot write to elevated windows).
 fn w32(e: &Win32Error, pid: u32) -> ErrorBody {
     let Win32Error::Call { call, source } = e;
     if source.code() == windows::core::HRESULT::from_win32(5)
@@ -193,7 +194,7 @@ fn empty_profiles() -> ProfileFile {
     }
 }
 
-/// Warnings for the settled state of a placed window (docs/V0.2.md "Detection").
+/// Warnings for the settled state of a placed window: forced size, forced position, frame back.
 fn outcome_warnings(
     target: Rect,
     fin: Rect,
@@ -1896,7 +1897,7 @@ impl Engine {
 
     fn set_profiles(&mut self, p: SetProfilesParams) -> Result<SetProfilesResult, ErrorBody> {
         let path = self.profiles_path()?;
-        // An invalid file on disk is reported, never overwritten (D-08).
+        // An invalid file on disk is reported, never overwritten: the user can fix a hand edit.
         let (mut file, revision) = profiles::load(&path).map_err(profile_err)?;
         if p.expected_revision
             .as_ref()

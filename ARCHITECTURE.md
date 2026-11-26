@@ -85,6 +85,60 @@ message (`ipc_handler` in `tray.rs`). Delays (apply delay, settle, re-assert) ar
   pipe is reported, and parallel calls start it once (`mcp.rs`, `call_resident`). The GUI probes with
   `hello`.
 
+## IPC protocol
+
+Reference for every client. All coordinates are physical pixels; hexadecimal styles are strings (`"0x94000000"`).
+
+**Envelope.** Request `{"id", "method", "params"?}`; response `{"id", "result"}` or `{"id", "error": {"code", "message", "data"?}}`. `id` is an integer or a string chosen by the client and returned unchanged. Several requests may be in flight; the engine serializes them. There are no server notifications: clients poll.
+
+**Common types.** `WindowRef` is `{"hwnd": n}` or `{"process": "game.exe", "title"?: "text"}` (`title` is a case-insensitive substring; several matches fail with `ambiguous_window` and `data.candidates`; `hwnd` is not stable across game runs). `Rect` is `{left, top, right, bottom}`. An island is referred to as `"layout/island"`. A monitor is an index, a device name (`\\.\DISPLAY1`) or `"primary"`.
+
+**Methods.** The MCP tools are these methods, same names and shapes, except `hello`.
+
+| Method | Params | Result |
+|---|---|---|
+| `hello` | none | `{protocol, version, pid, profiles_revision}`. Clients call it first and refuse a different `protocol`. |
+| `list_windows` | `{process?, include_hidden?, only_managed?}` | `{windows: [{hwnd, pid, process, title, class, visible, style, exstyle, rect, client: {w, h}, monitor: {index, device}, dpi, dpi_awareness, elevated, maximized, minimized, managed, island?}]}`. `dpi_awareness` is `unaware`, `system`, `per_monitor`, `per_monitor_v2` or `unknown`; `elevated` may be `null`. |
+| `apply` | `{window, island?, monitor?, offsets?, delay_ms?, use_profile?=true}` | `{applied, reason?, hwnd, target, final, settled, warnings}`. Request fields beat the process profile; without either, the window's current monitor is used. `applied: false` carries `reason` `already_placed` or `excluded`. Replies after the settle window, up to `delay_ms` + `PENDING_GRACE_MS` later. |
+| `place` | `{window, island, game_resolution?: {width, height}}` | Same as `apply`, without needing a saved profile. |
+| `restore` | `{window}` | `{restored, exact, hwnd}`. `exact` means style, ex-style and rect read back equal the originals; `restored: false` for a window that was not managed. |
+| `restore_all` | none | `{restored: n, failed: [{hwnd, error}]}`; tries every window even when some fail. |
+| `list_islands` | none | `{monitors: [{index, device, rect, dpi, primary}], layouts: [{id, monitor, islands: [{id, rect, occupants: [hwnd]}]}]}`, rects resolved. |
+| `get_profiles` | none | `{path, revision, version, profiles, layouts, warnings}`. `revision` is the SHA-256 of the file bytes. |
+| `set_profiles` | `{profiles?, layouts?, remove?: [process], remove_layouts?: [id], expected_revision?}` | `{revision, warnings}`. Upserts by `process` / layout `id`, removes, validates, saves atomically. A stale `expected_revision` fails with `revision_conflict`. |
+| `diagnose` | `{window, island?, monitor?, observe_ms?=3000, keep?=false}` | `{hwnd, process, target, verdict, timeline: [{t_ms, source, op?, style, exstyle, rect}], final, forced_size?, revert_latency_ms: {style?, rect?}, dpi_awareness, recommendations: [{code, text, data?}], restored}`. Applies, samples, and restores unless `keep`. `source` is `us` or `window`; `verdict` is `accepted`, `style_reverted`, `size_forced`, `position_forced`, `style_and_size_reverted` or `late_revert`. `observe_ms` is clamped to 100–`MAX_OBSERVE_MS`, not rejected. |
+
+**Precedence.** Request parameters beat profile fields; inside a profile, `island` beats `monitor` and `offsets` (`set_profiles` rejects the combination with `island_overrides_monitor`). A profile's `game_resolution` places the window at that size centred in the island, clipped (with `game_resolution_exceeds_island`) if larger.
+
+**Warnings** (`{code, data}`, on `apply`/`place`): `size_forced`, `position_forced`, `style_reverted` (what was observed in the settle window), `game_resolution_exceeds_island`, and `fights_back` once the guard gave up. `get_profiles` and `set_profiles` warnings are validation codes: `island_overrides_monitor`, `bad_island_ref`, `island_not_found` (informational), `bad_game_resolution`, and for layouts `bad_layout_id`, `duplicate_layout`, `bad_island_id`, `duplicate_island`, `bad_island_rect`. All but `island_not_found` block the write; a rejected write is `profile_error` with `data.warnings`, and only warnings about what the call itself wrote count.
+
+**Error codes.** `error.code` is stable; `message` is English and not part of the contract; `data` is optional.
+
+| `code` | When |
+|---|---|
+| `invalid_params`, `unknown_method`, `invalid_json` | Malformed request, unknown method, bad JSON or a line over `MAX_LINE`. `invalid_params` also covers `delay_ms` above `MAX_DELAY_MS`. |
+| `window_not_found`, `ambiguous_window`, `window_gone` | No match (or not a visible top-level window), several matches, or the window vanished mid-operation. |
+| `access_denied` | The window is elevated and the resident is not; `data.elevated: true`. |
+| `excluded_process` | `diagnose` on a process of the fixed exclusion list (`apply` reports it as `applied: false`, `reason: "excluded"`). |
+| `island_not_found`, `monitor_unavailable` | The island or monitor does not exist; never a fallback. |
+| `profile_error`, `revision_conflict`, `unsupported_version` | Loading, validating or saving `profiles.json`; a newer file `version`. |
+| `win32_error` | A call failed: `data.call`, `data.code` (Win32 code) and `data.hresult`; the message says `os error N`, never the system text. |
+| `busy` | An operation on that window is already running, or it is managed and `diagnose` was asked. |
+| `internal` | Unexpected failure. |
+
+**Limits.**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `PROTOCOL` | 2 | Returned by `hello`. |
+| `MAX_LINE` | 1 MiB | Longest JSON line; a longer one is drained to its newline and answered with `invalid_json`. |
+| `MAX_DELAY_MS` | 60 000 | Largest `delay_ms`, from a request or a profile. |
+| `MAX_OBSERVE_MS` | 15 000 | Largest `diagnose` observation. |
+| `PENDING_GRACE_MS` | 4 000 | How long an `apply` reply may wait past its delay. |
+| client deadline | 70 s | `max(MAX_DELAY_MS + PENDING_GRACE_MS, MAX_OBSERVE_MS)` + 6 s (`READ_TIMEOUT`). A client that times out cannot know whether its request ran: read the state again before retrying. |
+
+**Messages are English only.** Protocol messages, recommendation `text` and MCP tool descriptions are English; the panel localizes from `code` and `data`. MCP reports an IPC error, or malformed tool arguments, as a tool result with `isError: true`; an unknown tool name is JSON-RPC `-32602`. A tool result carries `started_resident: true` only when that call started the resident.
+
 ## Data files
 
 All in `BorderlessShatter\` under the user profile. Every write goes through `write_atomic` (`src/lib.rs`):
@@ -112,3 +166,28 @@ write `<file>.tmp`, `sync_all`, then rename, so a reader or a power cut sees the
 - Every `unsafe` block has a `// SAFETY:` comment; no `unwrap`/`expect` outside tests.
 - The pipe is per user with a protected DACL; the protocol and MCP tool texts are English only.
 - The editor saves with the `revision` it read, so a concurrent change is a `revision_conflict`, never a silent overwrite.
+
+## Design constraints
+
+Things the code or its contributors depend on, with the reason in one line each.
+
+- **One owner of restore state.** The original style, ex-style, rect and maximized flag live only in the resident's memory; a client that changed windows itself would leave them frameless when it exits.
+- **Placement, not reparenting.** Islands place a borderless top-level window in a rectangle; a `SetParent` container would put input and focus at risk and make the exact restore unreliable.
+- **Win event hooks, not polling.** They cost no CPU at rest, need no injection or administrator rights, and still see a game that puts its frame back later.
+- **Events and timers go to a message-only window.** Thread messages are lost while the tray menu runs its modal loop; the apply delay is a `SetTimer`, never a sleep.
+- **Style masks.** Applying clears `0x00CF0000` from the style and `0x020E0381` from the ex-style, writes the styles first and the rect second, and always passes `SWP_FRAMECHANGED`; skipping the flag was never shown to be safe. The masks are observed facts about Win32, not code taken from another project.
+- **The guard decides by the target rect, not by frame bits.** A game that already has no frame (Unity with `-popupwindow`, style `0x94000000`) still needs placing, and a frame-bit test would skip it.
+- **Guard tuning comes from measured games.** Settle 600 ms (three times the slowest observed revert), at most 3 re-asserts per cycle after 50/150/400 ms (re-asserting right after a revert only provokes another), stop when the same forced rect repeats, at most 3 cycles per minute; after that the window is marked `fights_back` and left alone until an explicit `apply`.
+- **Not elevated.** The manifest is `asInvoker`; UIPI makes writes to elevated windows fail, reported as `access_denied` with `data.elevated: true`.
+- **The manifest is embedded by `gpui-pre`.** A second one (`build.rs`, `app.rc`, `app.manifest`) collides with it at link time (`CVT1100`); if the GUI is ever split into its own binary, the resident one needs its own manifest back.
+- **Physical pixels everywhere.** Engine, pipe and profile coordinates are physical because the process is PerMonitorV2; a DPI-unaware game is sized in its own virtual pixels (`dpi/96`), which is why `list_windows` reports `dpi` and `dpi_awareness`.
+- **Islands round edges, not sizes.** `left = L + round(x·W)`, `right = L + round((x+w)·W)`, so adjacent islands share an edge with no gap or overlap at any width.
+- **A missing monitor is an error, never a fallback.** `monitor_unavailable` guarantees a game is not placed on the wrong screen; `list_islands` skips layouts whose monitor is gone.
+- **Several windows may share an island.** There is no eviction; a closed window's entry is dropped.
+- **Legacy preset ids are aliases.** `mitades-16-9`, `izquierda` and `derecha` resolve to `halves-16-9`, `left` and `right` (`LEGACY_ALIASES`), and `profiles.json` is never rewritten to the new names, so users who go back to an older build lose nothing.
+- **`profiles.json` is never destroyed.** Invalid JSON and a newer `version` are reported and left on disk; unknown fields are kept; a v1 file is read as v2 and only becomes v2 on disk when `set_profiles` or the panel saves, after a one-time `profiles.v1.bak`.
+- **`clip_cursor` is accepted and ignored.** Old profiles that carry it keep loading.
+- **Engine, IPC and MCP texts are English only.** Windows localizes OS error text, so messages carry `os error N` or `HRESULT 0x…` instead; clients match `code` and the panel renders its own sentence from `code` and `data`. Only the panel and the tray use the `es` catalog (fallback `es` → `en` → key).
+- **Locale order.** `BORDERLESS_SHATTER_LANG`, then the `language` setting, then the Windows UI language; the tray picks it up at the next resident start.
+- **MCP starts the resident, the CLI never does.** An assistant that calls `apply` without the app running cannot fix that itself, while a script that wants a failure should get exit code 3.
+- **`testwin` stands in for hostile games.** Real games cannot be made to revert a style or force a size on demand, so `examples/testwin.rs` imitates them; its timings differ slightly from the real ones (see `docs/GAMES.md`).

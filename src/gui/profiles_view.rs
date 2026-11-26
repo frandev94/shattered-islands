@@ -32,7 +32,7 @@ use crate::window_state::Offsets;
 
 // =================================================================== pure logic
 
-/// Engine ranges (docs/V0.2.md): kept here so the form rejects what the engine would.
+/// Engine ranges (`MAX_COORD` in `engine.rs`): kept here so the form rejects what the engine would.
 pub const MAX_OFFSET: i64 = 1_000_000;
 pub const MAX_RESOLUTION: i64 = 1_000_000;
 

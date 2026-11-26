@@ -1,6 +1,6 @@
 # Game compatibility
 
-Record of which games and applications have been tested with Borderless Shatter and how each one behaved.
+Record of which games and applications have been tested with Borderless Shatter and how each one behaved. Results are grouped by engine, because the engine decides most of how a game reacts; the use cases section groups them by the situation you want to solve.
 
 ## How to read this page
 
@@ -28,7 +28,15 @@ What is measured in each test:
 | Total War: Warhammer III | Warscape | prototype v0.1 | 2026-11-25 | ❌ | The game reverts style and size; cause in `preferences.script.txt` |
 | Phoenix Wright: Ace Attorney Trilogy | Unity | `3ecb3c9` | 2026-11-25 | ⚠️ | Removes the frame; Unity forces 1280x720 and repositions |
 
-## Notepad
+## Engines
+
+### Native Win32
+
+Applications that use the plain Windows frame and do not react to style or size changes.
+
+**Engine notes:** a cooperative window accepts any rect; the frame is removed and the restore is exact. Nothing to configure.
+
+#### Notepad
 
 Single monitor of 4096x1152 (virt.) = 5120x1440 physical. Rect (virt.) `[0,0,4096,1152]` = `rcMonitor`; the relative result (rect == `rcMonitor`) is still valid.
 
@@ -41,7 +49,15 @@ Single monitor of 4096x1152 (virt.) = 5120x1440 physical. Rect (virt.) `[0,0,409
 - `WM_QUIT` → exact restore.
 - With a 1500 ms delay: 5/5 exact.
 
-## Total War: Warhammer III
+### Warscape
+
+**Engine notes:**
+
+- **DPI:** unaware. Windows virtualizes the window and scales its bitmap, so the game's own resolution settings (`x_res`, `y_res`) are in virtual pixels: divide a physical target by `dpi/96` (2560 physical = `x_res 2048` at 125%).
+- **Window size and position are locked by the game's settings** (`fix_res`, `fix_window_pos` in `preferences.script.txt`); with them on, the engine undoes our style write and our `SetWindowPos`.
+- **Precedent in the same engine:** in Shogun 2, setting `fix_res false; fix_window_pos false; gfx_fullscreen false;` made Borderless Gaming work (issue #197, 2015).
+
+#### Total War: Warhammer III
 
 Process `Warhammer3.exe`, in windowed mode, not elevated. **DPI:** unaware (awareness 0, `GetDpiForWindow` 96); Windows virtualizes it and scales the bitmap. Physical window `[1350,6,3770,1405]`, physical client 2400x1350 = `x_res 1920` × 1.25 and `y_res 1080` × 1.25. The rects in the timeline (e.g. `[0,0,1936,1119]`) are (virt.).
 
@@ -60,15 +76,24 @@ Process `Warhammer3.exe`, in windowed mode, not elevated. **DPI:** unaware (awar
 - `fix_window_pos true` ("Forbid window repositioning")
 - `x_res 1920`, `y_res 1080`
 
-This is consistent with the immutable size observed. There is a precedent in the same engine: in Shogun 2, setting `fix_res false; fix_window_pos false; gfx_fullscreen false;` made Borderless Gaming work (issue #197, 2015).
+This is consistent with the immutable size observed.
 
-**What could be tested (untested):** with the game closed, `fix_res false`, `fix_window_pos false`, and, for a physical 2560x1440 half, `x_res 2048`, `y_res 1152` (virtual pixels, because the game is DPI-unaware: 2048 × 1.25 = 2560).
+**What could be tested (untested):** with the game closed and a copy of the file kept, `fix_res false`, `fix_window_pos false`, and, for a physical 2560x1440 half, `x_res 2048`, `y_res 1152` (virtual pixels, because the game is DPI-unaware: 2048 × 1.25 = 2560). Borderless Shatter only recommends these settings; it does not write to game files.
 
-**Reproduction:** `testwin --preset warscape` imitates this behavior (see below).
+**Reproduction:** `testwin --preset warscape` imitates this behavior (see [Test program](#test-program-testwin)).
 
-## Phoenix Wright: Ace Attorney Trilogy
+### Unity
 
-Process `PWAAT.exe` (Steam, `<Steam library>\steamapps\common\Phoenix Wright Ace Attorney Trilogy\`), Unity engine (`UnityPlayer.dll`, `PWAAT_Data`, window class `UnityWndClass`), 32-bit, in windowed mode, not elevated and launched without Unity arguments. Single monitor of 5120x1440 physical. **DPI:** per-monitor aware (awareness 2, DPI 120): physical = logical; client in a 1280x720 physical window. The coordinates in the timeline below (x=2126, 1732, 1852…) are (virt.) from the previous script; ×1.25 in physical. 
+**Engine notes:**
+
+- Detected from `UnityPlayer.dll`, a `<game>_Data` folder and the window class `UnityWndClass`.
+- Per-monitor DPI aware in the game tested (awareness 2): physical = logical, no conversion.
+- Command-line arguments that affect the window, from the [Unity Player command line arguments reference](https://docs.unity.com/en-us/engine/6000.6/manual/unity-editor/command-line-arguments/player.md) (checked 2026-11-26): `-popupwindow` creates the window as a dialog window without a frame; `-screen-width` and `-screen-height` override the default size and "must be an integer from a supported resolution"; `-window-mode` (Windows only) accepts `exclusive` or `borderless`. `-window-mode borderless` is untested here.
+- Unity moves and resizes its own window shortly after any external `SetWindowPos`; the size comes back in under 200 ms, and the final position changes from run to run.
+
+#### Phoenix Wright: Ace Attorney Trilogy
+
+Process `PWAAT.exe` (Steam, `<Steam library>\steamapps\common\Phoenix Wright Ace Attorney Trilogy\`), Unity engine (`UnityPlayer.dll`, `PWAAT_Data`, window class `UnityWndClass`), 32-bit, in windowed mode, not elevated and launched without Unity arguments. Single monitor of 5120x1440 physical. **DPI:** per-monitor aware (awareness 2, DPI 120): physical = logical; client in a 1280x720 physical window. The coordinates in the timeline below (x=2126, 1732, 1852…) are (virt.) from the previous script; ×1.25 in physical.
 
 **Configuration:** registry `HKCU\Software\CAPCOM\Phoenix Wright: Ace Attorney Trilogy / …` (read only):
 
@@ -112,17 +137,56 @@ The final position changes from one test to another (2126 in the immediate one, 
 
 **Untested ideas:**
 
-- With `-popupwindow -screen-width 2560 -screen-height 1440` (the size arguments were not respected in the test with 2048x1152).
+- With `-popupwindow -screen-width 2560 -screen-height 1440` (the size arguments were not respected in the test with 2048x1152, which may not be a supported resolution).
 - Set the resolution in PlayerPrefs to the island's size before launching.
 
-### With `-popupwindow`
+##### With `-popupwindow`
 
 Launched with `-popupwindow -screen-width 2048 -screen-height 1152`:
 
 - style `0x94000000` (`WS_POPUP`, no frame bits), ex-style `0`, physical client 1280x720: the size arguments were ignored.
 - Registry: `Screenmanager Resolution Width_h182942802` / `Height_h2627697771` = 1280 / 720 (before, 1600 / 900 were read without the `_h` names).
 - Manual `SetWindowPos` to `[2560,0,5120,1440]`: Unity reverts it in under 20 ms to 1280x720 at `[3677,0,4957,720]`. At `[0,0,2560,1440]`: `[2397,0,3677,720]`.
-- **Limitation of the app:** Borderless Shatter does not touch this window, because `has_targetable_style` requires frame bits and `capture()` returns `Ok(false)`. See D-14.
+- **Limitation of the v0.1 app:** Borderless Shatter did not touch this window, because the v0.1 guard (`has_targetable_style`) required frame bits and `capture()` returned `Ok(false)`. From v0.2 the guard decides by the target rect, so a window that already has no frame is managed (`testwin --preset unity-popup` reproduces it).
+
+## Use cases
+
+Each case points to the games on this page that show it. This page records no real-game run inside an island yet; the island figures below come from manual placement or from `testwin`.
+
+### Two games side by side on halves
+
+Preset `halves-16-9`: two 2560x1440 islands on a 5120x1440 monitor. Each game needs to accept a placement at a rect that is not the whole monitor.
+
+- [Notepad](#notepad): accepts any rect and restores exactly.
+- [Phoenix Wright](#phoenix-wright-ace-attorney-trilogy): moves to the island rect but forces its client to 1280x720; set the game resolution (`game_resolution` hint in the profile) so the window is centred in the island.
+- [Total War: Warhammer III](#total-war-warhammer-iii): not placed until its `fix_res` and `fix_window_pos` settings change.
+
+### DPI-unaware game on a scaled monitor
+
+The engine works in physical pixels; a DPI-unaware game gets the physical rect and Windows scales its bitmap, but its own resolution settings are virtual pixels (divide by `dpi/96`).
+
+- [Total War: Warhammer III](#total-war-warhammer-iii): awareness 0, DPI 96, client 2400x1350 = `x_res 1920` × 1.25.
+- Contrast: [Phoenix Wright](#phoenix-wright-ace-attorney-trilogy) is per-monitor aware; physical = logical.
+
+### Game that fights back
+
+The game puts its frame or its size back after our write. The guard re-asserts a few times, then stops and marks `fights_back`; `diagnose` measures what the game does.
+
+- [Total War: Warhammer III](#total-war-warhammer-iii): reverts style (~8 ms) and size (~2 ms); the cause is in its settings file.
+- [Phoenix Wright](#phoenix-wright-ace-attorney-trilogy): keeps the removed style but forces the size (~60 ms) and repositions.
+- Test double for a late revert: `testwin --late-frame 1500` (no real game recorded).
+
+### Game that already has no frame
+
+A window created without frame bits (Unity with `-popupwindow`, style `0x94000000`) still needs placing and restoring.
+
+- [Phoenix Wright with `-popupwindow`](#with--popupwindow): `WS_POPUP`, no frame bits; Unity reverts a manual placement in under 20 ms.
+
+### Cooperative application
+
+An application that does not react to our changes; the baseline for exact restore.
+
+- [Notepad](#notepad): 5/5 exact, with and without delay.
 
 ## Test program `testwin`
 
@@ -141,15 +205,21 @@ The restore was exact in all runs of the app.
 
 The previous matrix of 6 modes (12 scenarios) was done with the earlier version, in virtualized pixels; its figures do not apply to this table.
 
-## How to add a game
+## Contributing a result
 
-Record, for each game:
+Copy this template into the engine's section (add a new `###` section if the engine is not listed), and add a row to the summary table. Write `Engine: unknown` when you cannot name the engine from a primary or official source; never guess.
 
-- **Process**: executable name and whether it is elevated.
-- **Engine**.
-- **Game window mode**: windowed, native borderless or fullscreen.
-- **Relevant configuration files**: path and options that affect size, position or mode.
-- **Values before/after**: style, ex-style and rect, immediate and with delay.
-- **Whether the game reverts**: which value and how many ms later.
-- **Restore**: whether it is exact after `WM_QUIT`.
-- Borderless Shatter version or commit, date and status (✅/⚠️/❌/❓); add the row to the summary.
+```markdown
+#### <Game or app> <✅|⚠️|❌|❓>
+
+- **Engine:** <name, or `unknown`> (source: <link or file that shows it>)
+- **Process:** `<exe>`, elevated: <yes|no>
+- **Window mode:** <windowed | native borderless | fullscreen>
+- **DPI awareness:** <unaware | system | per-monitor>, DPI <n>
+- **Configuration files:** <path and the options that affect size, position or mode>
+- **Before / after:** style `0x…`, ex-style `0x…`, rect `[l,t,r,b]`, immediate and with delay
+- **Does the game revert it?** <which value, how many ms later>
+- **Restore:** <exact after `WM_QUIT` or not>
+- **Borderless Shatter version or commit, date**
+- **Use cases it shows:** <links to the use cases above>
+```
