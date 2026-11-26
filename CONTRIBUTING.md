@@ -73,7 +73,46 @@ the last tag include a `feat`, `fix`, `perf` or a breaking change (`!` after the
 appear in the changelog of the next release. When none qualifies the run ends green with a notice. Do not edit the generated `CHANGELOG.md` sections or tag by hand.
 `CHANGELOG.md` must start with the `header` of `cliff.toml` (CI checks it); change both together.
 
+### Manual release
+
+Use this for a forced version level, or to release docs-only changes.
+
+1. On `main`, up to date with `origin/main`, with a clean tree (`git status --short` empty) and `cargo test`
+   green. Cut releases from the main checkout, not from an issue worktree.
+2. Next version: `git cliff --bumped-version`, or the level wanted from the latest tag. Never below the
+   `version` already in `Cargo.toml`. On 0.x, a `feat` bumps only the patch in git-cliff's proposal, so set
+   the level explicitly when a higher one is needed.
+3. Set `version` in `Cargo.toml`, then `cargo update -p borderless-shatter` (refreshes only the package's
+   `Cargo.lock` entry).
+4. `git cliff --unreleased --tag vX.Y.Z --prepend CHANGELOG.md` (never `-o`: it would drop the hand-written
+   entries below the header). If `git-cliff` is missing, install it with `scoop install git-cliff`.
+5. Review the new CHANGELOG section and the version.
+6. `git add Cargo.toml Cargo.lock CHANGELOG.md`, commit `chore(release): vX.Y.Z` (the workflow skips that
+   message), then `git tag -a vX.Y.Z -m "borderless-shatter vX.Y.Z"`. Commit with the identity configured in
+   the checkout.
+7. `cargo build --release --locked`, then the `.sha256` (`sha256sum` run inside `target/release`), before
+   pushing, so a broken build leaves no tag. Push in one atomic push: `git push --atomic origin main vX.Y.Z`.
+   Then `gh release create vX.Y.Z --title vX.Y.Z --notes-file <(git cliff --latest --strip all) target/release/borderless-shatter.exe target/release/borderless-shatter.exe.sha256`.
+
+Never move or delete a pushed tag; a wrong release gets a new release.
+
+### Recovering a failed release
+
+- **Before the push** (a check, the build, or a push rejected because `main` moved): nothing landed. The next
+  push to `main` that touches the release paths releases everything pending. Re-running the workflow helps
+  only after a transient failure while `main` has not moved.
+- **After the push** (`gh release create` failed): the tag exists without a release, the run says so with
+  `::error`, and every later `publish` job fails before pushing until the release exists. Create the release
+  from the failed run's artifact, which holds the exe built from exactly the tagged tree:
+  `gh run download <run-id> -n release -D rel`, then
+  `gh release create vX.Y.Z --title vX.Y.Z --notes-file rel/notes.md rel/borderless-shatter.exe rel/borderless-shatter.exe.sha256`.
+  If the artifact has expired, build from the tag instead: `cargo build --release --locked` on a checkout of
+  `vX.Y.Z`, run `sha256sum` inside `target/release`, and attach those files. Then re-run the blocked
+  `publish` job, or let the next push release.
+
 ## Clean-room and licence
 
-The project is MIT. Never copy or translate code or text from Borderless Gaming (GPL-2.0), ihateborders
-(GPL-3.0) or Zed's GPL crates, and do not add dependencies whose licence `cargo deny` rejects.
+Shattered Islands is a clean-room implementation: no code or text from GPL projects is copied, and behaviour
+is documented from public sources. The project is MIT, so never copy or translate code or text from Borderless
+Gaming (GPL-2.0), ihateborders (GPL-3.0) or Zed's GPL crates, and do not add dependencies whose licence
+`cargo deny` rejects.

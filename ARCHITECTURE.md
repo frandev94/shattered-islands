@@ -1,6 +1,6 @@
 # Architecture
 
-Borderless Shatter (0.2.0) is one Windows executable, `borderless-shatter.exe`, that makes game windows
+Borderless Shatter is one Windows executable, `borderless-shatter.exe`, that makes game windows
 borderless and places them in "islands" (rectangles on a monitor). It is a single Rust crate (library plus
 binary) with no runtime other than the OS.
 

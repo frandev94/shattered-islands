@@ -2,7 +2,7 @@ name: test
 
 # Pull requests always run it. A push to main runs it here when it touches anything outside the paths
 # below; release.yml calls this workflow for pushes touching those paths. A push touching both
-# (src/ plus docs) is therefore tested twice on the 2x Windows minutes: path filters cannot express
+# (src/ plus docs) is therefore tested twice: path filters cannot express
 # "none of these files changed".
 on:
   pull_request:
