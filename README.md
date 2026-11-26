@@ -1,23 +1,43 @@
-# Borderless Shatter
+# Shattered Islands
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.svg"><img src="docs/banner-light.svg" alt="Shattered Islands — borderless windows and screen islands for Windows" width="100%"></picture></p>
+<p align="center"><a href="https://github.com/frandev94/shattered-islands/releases"><img src="https://img.shields.io/badge/releases-GitHub-45C4B0?style=for-the-badge&logo=github&labelColor=0E1316" alt="Releases"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/licence-MIT-45C4B0?style=for-the-badge&labelColor=0E1316" alt="MIT licence"></a> <a href="#requirements-and-build"><img src="https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white&labelColor=0E1316" alt="Windows"></a> <a href="#requirements-and-build"><img src="https://img.shields.io/badge/made%20with-Rust-DEA584?style=for-the-badge&logo=rust&logoColor=white&labelColor=0E1316" alt="Made with Rust"></a></p>
 
-Windows utility that removes the frame from game and app windows and fits them to the monitor, with exact restore.
+Free MIT alternative to Borderless Gaming — borderless windows and screen islands for Windows
+
+Until the [rename](https://github.com/frandev94/shattered-islands/issues/13) lands, the executable `borderless-shatter.exe`, the data folders `%APPDATA%\BorderlessShatter\` and `%LOCALAPPDATA%\BorderlessShatter\`, the named pipe and the MCP server still use `borderless-shatter` / `BorderlessShatter`, and the tray tooltip and the panel title still read "Borderless Shatter".
 
 ## What it does
 
-Version 0.2:
-
-- Removes the frame (title bar, borders, buttons) from the windows of processes that have a profile and fits them to the monitor, or to an *island*: a named rectangle of a monitor (for example, one half of a 32:9 screen).
-- Handles windows that already have no frame, and keeps a guard that re-asserts the placement a limited number of times against games that fight back.
+- Runs in the tray: double-click the icon to open the panel, right-click for the menu.
+- Panel views: Windows, Islands, Island editor, Profiles and Diagnostics.
+- Fits windows to the monitor or to an *island*: a named rectangle of a monitor (for example, one half of a 32:9 screen). The read-only `halves-16-9` preset ships built in.
+- Removes the frame (title bar, borders, buttons) from the windows of processes that have a profile, handles windows that already have no frame, and keeps a guard that re-asserts the placement a limited number of times against games that fight back.
 - Restores the window exactly as it was (style, position, size, maximized state) when requested and on exit; after an abrupt shutdown it re-adopts the modified windows from `state.json`.
 - Detects new windows through Windows events, without polling.
-- Lives in the system tray, with a panel (GPUI) to manage windows, islands, profiles and diagnostics.
-- Offers an MCP server and a command-line client, both clients of the same named pipe.
+- Offers an MCP server (9 tools) and a command-line client, both clients of the same named pipe. The MCP server can start the resident program; the CLI cannot.
 - Single instance: a second run does not create another icon.
-- Does not need administrator permissions.
+- English and Spanish. Does not need administrator permissions.
+
+### How it fits together
+
+```mermaid
+flowchart LR
+    client["MCP client"] -->|"stdio"| mcp["borderless-shatter mcp"]
+    panel["Panel: borderless-shatter gui"]
+    cli["CLI: borderless-shatter subcommands"]
+    resident["Tray resident"]
+    mcp -->|"named pipe"| resident
+    panel -->|"named pipe"| resident
+    cli -->|"named pipe"| resident
+    resident -->|"places and restores"| windows["Game and app windows"]
+    resident <-->|"reads and writes"| data["profiles.json and state.json"]
+    panel -->|"writes"| settings["settings.json"]
+    settings -->|"read for the language (resident, panel, CLI)"| resident
+```
 
 ## Status
 
-Version 0.2. The earlier prototype (v0.1) was tested on 2026-11-25 on one 5120x1440 physical monitor at 125% scale:
+An earlier build, before islands and the panel, was tested on 2026-11-25 on one 5120x1440 physical monitor at 125% scale:
 
 - Notepad: applies and restores exactly; with a 1500 ms delay, 5 of 5 exact.
 - Test window `testwin`, 12 scenarios (immediate and with a 1500 ms delay): exact restore in all of them.
@@ -122,7 +142,9 @@ File: `%APPDATA%\BorderlessShatter\profiles.json`. If it does not exist, it is c
 | `delay_ms` | number | `0` | Wait in milliseconds before applying (at most 60000) |
 | `clip_cursor` | boolean | `false` | Accepted and ignored |
 
-Fields this version does not know are kept when the file is saved, at the file level and inside each profile, layout and island (not inside `rect`, `offsets`, `game_resolution` or `monitor`). Saving from the panel keeps them. When `set_profiles` replaces a profile, layout or island, it keeps the old unknown fields unless the new item brings its own; islands are matched by `id`. To remove them, send the items without them and `"replace_extras": true`: each sent item is stored exactly as sent, and items not sent are untouched.
+Fields the program does not know are kept when the file is saved, at the file level and inside each profile, layout and island (not inside `rect`, `offsets`, `game_resolution` or `monitor`). Saving from the panel keeps them. When `set_profiles` replaces a profile, layout or island, it keeps the old unknown fields unless the new item brings its own; islands are matched by `id`. To remove them, send the items without them and `"replace_extras": true`: each sent item is stored exactly as sent, and items not sent are untouched.
+
+An older resident on the same pipe ignores `replace_extras` (it does not reject unknown params), so the call succeeds and keeps the old keys; avoid mixing versions. Duplicating a layout in the editor copies its unknown keys and its islands' keys (intended). Unknown keys at the top level of `profiles.json` cannot be cleared through `set_profiles`; edit the file by hand.
 
 ## Islands
 
@@ -143,7 +165,7 @@ Built-in preset, read-only (to change it, duplicate it into your own layout; a l
 | `halves-16-9/left` | Left half of the primary monitor |
 | `halves-16-9/right` | Right half of the primary monitor |
 
-On a 5120x1440 monitor each half is 2560x1440, 16:9. The ids used before v0.2 final still work as aliases: `mitades-16-9/izquierda` is `halves-16-9/left` and `mitades-16-9/derecha` is `halves-16-9/right`. Your files are not rewritten because of an alias.
+On a 5120x1440 monitor each half is 2560x1440, 16:9. Older ids still work as aliases: `mitades-16-9/izquierda` is `halves-16-9/left` and `mitades-16-9/derecha` is `halves-16-9/right`. Your files are not rewritten because of an alias.
 
 ## Data files
 
@@ -268,10 +290,23 @@ The old `--mode` names (`normal`, `fixed`, `revert-style`, `force-size`, `warsca
 
 The goal is "islands", named rectangles on the monitor, to split a 32:9 screen into two 16:9 ones and place one game in each.
 
-- **v0.1** (done): borderless at full monitor size, exact restore and tray.
-- **v0.2** (this version): islands in JSON (first preset: two 16:9 halves), windows that already have no frame, guard with re-assertions, IPC over a named pipe, GUI with GPUI, MCP server and CLI.
-- **v0.3**: keyboard shortcuts to move the active window to an island.
-- **Later**: container with `SetParent` only if needed, per-game settings, console shim for the CLI.
+- [x] Borderless at full monitor size, with exact restore and tray
+- [x] Islands in JSON, with the two-16:9-halves preset
+- [x] Frameless windows and the guard with limited re-assertions
+- [x] IPC over a named pipe
+- [x] GPUI panel with the island editor and diagnostics
+- [x] MCP server and command-line client
+- [x] Re-adoption of windows after an abrupt shutdown
+- [x] English and Spanish
+- [ ] [Keyboard shortcuts to send the active window to an island](https://github.com/frandev94/shattered-islands/issues/31)
+- [ ] [Per-game settings](https://github.com/frandev94/shattered-islands/issues/32)
+- [ ] [Console shim for the CLI](https://github.com/frandev94/shattered-islands/issues/33)
+- [ ] [Container window with `SetParent`, only if needed](https://github.com/frandev94/shattered-islands/issues/34)
+- [ ] [Product rename](https://github.com/frandev94/shattered-islands/issues/13)
+- [ ] [Tray icon in the panel palette](https://github.com/frandev94/shattered-islands/issues/30)
+- [ ] [Public release](https://github.com/frandev94/shattered-islands/issues/29)
+
+Bugs and QA work are tracked in the [issue list](https://github.com/frandev94/shattered-islands/issues).
 
 ## Documentation
 
