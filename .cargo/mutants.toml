@@ -1,0 +1,5 @@
+# cargo-mutants config. Run only on pure logic, scoped to your change:
+#   git diff main > target/change.diff && cargo mutants --in-diff target/change.diff
+# Full run (slow): cargo mutants
+# Windows-bound code is not mutation-testable without a desktop session.
+exclude_globs = ["src/win32/**", "src/gui/**", "src/tray.rs", "src/main.rs"]

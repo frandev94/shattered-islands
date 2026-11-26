@@ -1,0 +1,11 @@
+{
+  "tray.open_panel": "Abrir panel",
+  "tray.apply": "Aplicar: {process}",
+  "tray.place_submenu": "Colocar ventana activa en isla",
+  "tray.restore_all": "Restaurar todas",
+  "tray.reload": "Recargar perfiles",
+  "tray.quit": "Salir",
+  "tray.status.no_pipe": "sin tubería IPC: {error}",
+  "tray.status.pipe_stopped": "Tubería IPC detenida: {error}",
+  "tray.status.menu_error": "menú: {error}"
+}

@@ -1,0 +1,67 @@
+name: test
+
+# Pull requests always run it. A push to main runs it here when it touches anything outside the paths
+# below; release.yml calls this workflow for pushes touching those paths. A push touching both
+# (src/ plus docs) is therefore tested twice on the 2x Windows minutes: path filters cannot express
+# "none of these files changed".
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: [src/**, locales/**, Cargo.toml, Cargo.lock]
+  workflow_call:
+    outputs:
+      sha:
+        description: Commit the checks ran on
+        value: ${{ jobs.test.outputs.sha }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: windows-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # release.yml's `git cliff --prepend` duplicates the header unless CHANGELOG.md starts with
+      # cliff.toml's [changelog] header (line endings aside): change both in the same commit.
+      - name: CHANGELOG.md starts with the cliff.toml header
+        shell: python
+        run: |
+          import pathlib, sys, tomllib
+          header = tomllib.loads(pathlib.Path("cliff.toml").read_text(encoding="utf-8"))["changelog"]["header"]
+          if not pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").startswith(header):
+              print("::error file=CHANGELOG.md,line=1::CHANGELOG.md must start with the [changelog] header of cliff.toml; change both in the same commit.")
+              sys.exit(1)
+      - id: sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # rust-toolchain.toml pins the channel and components; rustup installs them on first use.
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # No --ignored: the e2e tests open real windows.
+      - run: cargo test
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # cargo-deny-action is Docker (Linux only): install the official Windows binary pinned by the sha256 GitHub publishes for the 0.22.1 asset.
+      - name: Install cargo-deny 0.22.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          d=cargo-deny-0.22.1-x86_64-pc-windows-msvc
+          curl -sSfLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.1/$d.tar.gz"
+          echo "b8d7e473f54c328cc528ef8aea221c40b5ccac3d63844aa056f86ed0886800a2  $d.tar.gz" | sha256sum -c -
+          tar -xzf "$d.tar.gz"
+          cygpath -w "$PWD/$d" >> "$GITHUB_PATH"
+      - run: cargo deny check licenses

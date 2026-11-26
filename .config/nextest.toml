@@ -1,0 +1,10 @@
+# nextest is optional: plain `cargo test` stays a valid path. Doctests are not run by nextest (`cargo test --doc`).
+[test-groups]
+# Suites that create real windows or resident processes must not overlap.
+e2e = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary(e2e) | binary(mcp) | binary(cli)"
+test-group = "e2e"
+# A hung window test is killed after 3 x 60 s instead of blocking the run.
+slow-timeout = { period = "60s", terminate-after = 3 }

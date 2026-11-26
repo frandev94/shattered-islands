@@ -1,0 +1,3 @@
+[alias]
+# Resident end-to-end suite: creates real windows, one test at a time.
+e2e = "test --test e2e -- --ignored --test-threads=1"

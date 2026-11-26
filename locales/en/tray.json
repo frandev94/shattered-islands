@@ -1,0 +1,11 @@
+{
+  "tray.open_panel": "Open panel",
+  "tray.apply": "Apply: {process}",
+  "tray.place_submenu": "Place active window in island",
+  "tray.restore_all": "Restore all",
+  "tray.reload": "Reload profiles",
+  "tray.quit": "Quit",
+  "tray.status.no_pipe": "no IPC pipe: {error}",
+  "tray.status.pipe_stopped": "IPC pipe stopped: {error}",
+  "tray.status.menu_error": "menu: {error}"
+}

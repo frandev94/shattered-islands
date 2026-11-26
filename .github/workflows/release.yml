@@ -1,0 +1,217 @@
+name: release
+
+# Every push to main that changes what ships cuts a release: the version comes from the conventional
+# commits since the last tag (cliff.toml) and lands in Cargo.toml, Cargo.lock, CHANGELOG.md, an annotated
+# tag and a GitHub release carrying borderless-shatter.exe and its .sha256. Docs and tests alone cut none.
+# Three jobs, so the write token never shares a job with compiled third-party code (build scripts, proc-macros):
+#   test (read)     fmt, clippy, tests, docs, licenses on the pushed commit; exposes its SHA.
+#   build (read)    version, Cargo.toml/Cargo.lock/CHANGELOG.md, exe and .sha256 from that SHA; uploads them.
+#   publish (write) never compiles: checks the uploaded files hold only the release edits, commits them, tags,
+#                   and only its last step sees the token.
+# Windows runners bill 2x on a private repo: only test and build run there (the exe is built on Windows).
+on:
+  push:
+    branches: [main]
+    paths: [src/**, locales/**, Cargo.toml, Cargo.lock]
+
+permissions:
+  contents: read
+
+# One release at a time. Each run releases the commit that triggered it: if main moved meanwhile
+# (a human push, or an earlier run's release commit) its atomic push is rejected, nothing lands,
+# and the next push to main releases the pending commits.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Read-only: the called workflow checks out the pushed commit and exposes its SHA.
+  test:
+    # A release commit pushed by hand (CONTRIBUTING.md#releases) already carries its version.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    uses: ./.github/workflows/test.yml
+  build:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      last: ${{ steps.version.outputs.last }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows checkouts default to CRLF, which would break the byte-exact `header` match of --prepend (cliff.toml).
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.test.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # The official Windows binary, pinned by the sha256 GitHub publishes for the v2.14.2 asset
+      # (git-cliff publishes .sha512 files for Linux/macOS only).
+      - name: Install git-cliff 2.14.2
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          f=git-cliff-2.14.2-x86_64-pc-windows-msvc.zip
+          curl -sSfLO "https://github.com/orhun/git-cliff/releases/download/v2.14.2/$f"
+          echo "6ece2112b3f4af462190ecbea4aeb1315fff6af415629b597f84319073c31131  $f" | sha256sum -c -
+          pwsh -NoProfile -Command "Expand-Archive -Path $f -DestinationPath gc"
+          cygpath -w "$PWD/gc/git-cliff-2.14.2" >> "$GITHUB_PATH"
+      # An empty `version` output means nothing to release; build and publish are skipped.
+      - name: Version
+        id: version
+        run: |
+          set -euo pipefail
+          # True when version $1 is strictly greater than $2 (both without the leading v).
+          version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
+          last=$(git describe --tags --abbrev=0) || {
+            echo "::error::No tag reachable from this commit: tag the last 0.1 commit v0.1.0 first (CONTRIBUTING.md#releases)."
+            exit 1
+          }
+          bumped=$(git cliff --bumped-version)
+          if [ "$bumped" = "$last" ]; then
+            if [ -n "$(git rev-list "$last"..HEAD)" ]; then
+              echo "::warning::Commits since $last bump nothing: non-conventional messages (feat:/fix:/... missing)? No release was cut."
+            fi
+            echo "Nothing to release since $last"
+            exit 0
+          fi
+          # The package's own version is the first `version =` line of Cargo.toml.
+          cur=$(grep -m 1 -E '^version = "' Cargo.toml | cut -d '"' -f 2)
+          # On 0.x a feat bumps only the patch, so git-cliff can propose less than a version raised by hand
+          # in Cargo.toml (v0.1.0 + feat = v0.1.1 while Cargo.toml says 0.2.0): never release a downgrade.
+          v=$bumped
+          if ! version_gt "${bumped#v}" "$cur"; then
+            echo "::notice::git-cliff proposes $bumped, not above Cargo.toml $cur: releasing v$cur."
+            v=v$cur
+          fi
+          if ! version_gt "${v#v}" "${last#v}"; then
+            echo "::error::Next version $v is not above the last tag $last (git-cliff $bumped, Cargo.toml $cur). Fix Cargo.toml (CONTRIBUTING.md#releases)."
+            exit 1
+          fi
+          echo "Releasing $v (last tag $last)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+      - name: Bump and build
+        if: ${{ steps.version.outputs.version != '' }}
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"${V#v}\"/" Cargo.toml
+          grep -q "^version = \"${V#v}\"" Cargo.toml
+          # Refreshes only the package's own Cargo.lock entry; --locked below then proves the lock is complete.
+          cargo update -p borderless-shatter
+          git diff --stat Cargo.lock
+          # Prepend only the new section under the header; older hand-written entries stay (cliff.toml).
+          git cliff --unreleased --tag "$V" --prepend CHANGELOG.md
+          out="$RUNNER_TEMP/release"
+          mkdir -p "$out"
+          git cliff --unreleased --tag "$V" --strip all > "$out/notes.md"
+          cargo build --release --locked
+          cp target/release/borderless-shatter.exe Cargo.toml Cargo.lock CHANGELOG.md "$out/"
+          (cd "$out" && sha256sum borderless-shatter.exe > borderless-shatter.exe.sha256 && cat borderless-shatter.exe.sha256)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ steps.version.outputs.version != '' }}
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+  publish:
+    needs: [test, build]
+    if: ${{ needs.build.outputs.version != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      V: ${{ needs.build.outputs.version }}
+      LAST: ${{ needs.build.outputs.last }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.test.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+      - name: Commit and tag
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/release"
+          # Both assets must exist and match before anything is pushed.
+          (cd "$d" && sha256sum -c borderless-shatter.exe.sha256)
+          test -s "$d/notes.md"
+          cp "$d/Cargo.toml" "$d/Cargo.lock" "$d/CHANGELOG.md" .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git diff --cached --stat
+          # build ran dependency build scripts, which could have edited these files: commit only the release
+          # edits (package version in Cargo.toml and Cargo.lock, a section prepended under the CHANGELOG header).
+          python3 - <<'EOF'
+          import os, re, subprocess, sys, tomllib
+
+          def fail(msg):
+              print(f"::error::The build artifact changes more than the release edits: {msg}. Nothing was pushed.")
+              sys.exit(1)
+
+          def show(rev, path):  # bytes decoded as-is, so line-ending changes are caught too
+              return subprocess.run(["git", "show", f"{rev}:{path}"], check=True, capture_output=True).stdout.decode()
+
+          v = os.environ["V"].removeprefix("v")
+          if not re.fullmatch(r"\d+\.\d+\.\d+", v):
+              fail(f"version {v!r} is not X.Y.Z")
+          names = subprocess.run(["git", "diff", "--cached", "--name-only"], check=True, capture_output=True).stdout.decode().split()
+          if extra := set(names) - {"Cargo.toml", "Cargo.lock", "CHANGELOG.md"}:
+              fail(f"unexpected files {sorted(extra)}")
+
+          def check_version_line(path, anchor):  # the package version: first `version = ` line after anchor
+              old, new = (show(rev, path).splitlines(keepends=True) for rev in ("HEAD", ""))
+              if old.count(anchor) != 1:
+                  fail(f"{path} has no single {anchor.strip()!r} line")
+              i = old.index(anchor) + 1
+              while i < len(old) and not old[i].startswith(("version = ", "[")):
+                  i += 1
+              if i == len(old) or not old[i].startswith("version = "):
+                  fail(f"{path} has no version line after {anchor.strip()!r}")
+              if len(old) != len(new) or any(a != b for k, (a, b) in enumerate(zip(old, new)) if k != i):
+                  fail(f"{path} changes more than its package version line {i + 1}")
+              if new[i] != f'version = "{v}"\n':
+                  fail(f"{path} line {i + 1} is {new[i]!r}, not version {v}")
+
+          check_version_line("Cargo.toml", "[package]\n")
+          check_version_line("Cargo.lock", 'name = "borderless-shatter"\n')
+
+          header = tomllib.loads(show("HEAD", "cliff.toml"))["changelog"]["header"]
+          old, new = show("HEAD", "CHANGELOG.md"), show("", "CHANGELOG.md")
+          rest = old.removeprefix(header)
+          if not (old.startswith(header) and new.startswith(header) and new.endswith(rest) and len(new) >= len(old)):
+              fail("CHANGELOG.md is not the cliff.toml header, then new lines, then the previous content")
+          added = new[len(header) : len(new) - len(rest)]
+          if added and not added.endswith("\n"):
+              fail("CHANGELOG.md's new section runs into the previous first line")
+          EOF
+          git commit -m "chore(release): $V"
+          git tag -a "$V" -m "borderless-shatter $V"
+      # The only step with the write token: no repo or dependency code runs here.
+      - name: Push and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/release"
+          if ! gh release view "$LAST" >/dev/null 2>&1; then
+            echo "::error::Tag $LAST has no GitHub release (an earlier run failed after its push). Create it with its assets first (CONTRIBUTING.md#releases), then re-run this job."
+            exit 1
+          fi
+          git push --atomic "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" HEAD:main "refs/tags/$V"
+          gh release create "$V" --title "$V" --notes-file "$d/notes.md" "$d/borderless-shatter.exe" "$d/borderless-shatter.exe.sha256" || {
+            echo "::error::$V is pushed but its GitHub release failed. Create it from this run's 'release' artifact (CONTRIBUTING.md#releases)."
+            exit 1
+          }

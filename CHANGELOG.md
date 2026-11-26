@@ -1,32 +1,32 @@
 # Changelog
 
-Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/).
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Sin publicar]
+## [0.1.0] - 2026-11-25
 
-### Añadido
+### Added
 
-- Prototipo v0.1 (`f307532`): quita el marco y ajusta la ventana a la resolución del monitor (`rcMonitor`) de los procesos que indique el perfil, y restaura el estado original exacto al salir o al pulsar «Restaurar todo».
-- Detección de ventanas nuevas mediante hooks `EVENT_OBJECT_SHOW` y `EVENT_SYSTEM_FOREGROUND` (fuera de contexto) y ventana de solo mensajes para recibirlos.
-- Retraso configurable por perfil (`delay_ms`) con `SetTimer`: la ventana se posiciona de inmediato y el ajuste de estilo se aplica después.
-- Perfiles JSON (`version: 1`) con `enabled`, `monitor`, `offsets`, `delay_ms` y `clip_cursor`; un archivo inválido se informa y nunca se sobrescribe.
-- Lista de exclusiones de procesos del sistema y de la propia aplicación.
-- Instancia única y manifiesto con `asInvoker` y DPI `PerMonitorV2`.
-- Icono de bandeja con «Aplicar», «Restaurar todo», «Recargar» y «Salir».
-- Licencia MIT.
-- Herramienta de prueba `examples/testwin` (`27f1555`) con seis modos que reproducen comportamientos observados en juegos: `normal`, `fixed`, `revert-style`, `force-size`, `warscape` y `late-frame`.
-- testwin: comportamientos combinables (estilo, revertir estilo, forzar tamaño, recolocar, marco tardío, DPI) y presets medidos en juegos reales: `warscape` (TW:WH3), `unity` y `unity-popup` (Phoenix Wright), `notepad`.
+- Prototype v0.1 (`f07d5c9`): removes the frame and fits the window to the monitor resolution (`rcMonitor`) of the processes listed in the profile, and restores the exact original state on exit or when pressing "Restaurar todo".
+- Detection of new windows through `EVENT_OBJECT_SHOW` and `EVENT_SYSTEM_FOREGROUND` hooks (out of context) and a message-only window to receive them.
+- Configurable delay per profile (`delay_ms`) with `SetTimer`: the window is positioned immediately and the style change is applied afterwards.
+- JSON profiles (`version: 1`) with `enabled`, `monitor`, `offsets`, `delay_ms` and `clip_cursor`; an invalid file is reported and never overwritten.
+- Exclusion list of system processes and of the application itself.
+- Single instance and manifest with `asInvoker` and DPI `PerMonitorV2`.
+- Tray icon with "Aplicar", "Restaurar todo", "Recargar" and "Salir".
+- MIT license.
+- Test tool `examples/testwin` (`07ca9a2`) with six modes that reproduce behaviors observed in games: `normal`, `fixed`, `revert-style`, `force-size`, `warscape` and `late-frame`.
+- testwin: combinable behaviors (style, revert style, force size, reposition, late frame, DPI) and presets measured on real games: `warscape` (TW:WH3), `unity` and `unity-popup` (Phoenix Wright), `notepad`.
 
-### Cambiado
+### Changed
 
-- Documentación corregida a píxeles físicos (monitor 5120x1440 al 125 %; islas de 2560x1440).
+- Documentation corrected to physical pixels (monitor 5120x1440 at 125%; islands of 2560x1440).
 
-### Corregido
+### Fixed
 
-Correcciones aplicadas antes del primer commit (incluidas en `f307532`):
+Fixes applied before the first commit (included in `f07d5c9`):
 
-- Una ventana maximizada que se minimiza se captura en estado restaurado, para guardar el rectángulo original correcto.
-- `restore()` no se detiene al primer error: intenta el estilo, el rectángulo y la maximización, y devuelve el primer error.
-- El destino del retraso se calcula una sola vez en la captura; el paso diferido no vuelve a leer el perfil.
-- Una ventana restaurada desde la bandeja no se vuelve a aplicar en el siguiente foco.
-- «Aplicar» desde la bandeja respeta las exclusiones y el formato de nombre (ruta o nombre de archivo).
+- A maximized window that is minimized is captured in its restored state, so the correct original rectangle is saved.
+- `restore()` does not stop at the first error: it tries the style, the rectangle and the maximization, and returns the first error.
+- The delay target is calculated once at capture; the deferred step does not read the profile again.
+- A window restored from the tray is not applied again on the next focus.
+- "Aplicar" from the tray respects the exclusions and the name format (path or file name).

@@ -1,71 +1,133 @@
 //! Pure window-state model and geometry math (no Win32 types).
+//!
+//! All coordinates are physical pixels in virtual-desktop space; `right`/`bottom` are exclusive.
+//! Arithmetic saturates instead of overflowing.
+//!
+//! ```
+//! use borderless_shatter::window_state::{Offsets, Rect, target_rect};
+//!
+//! let monitor = Rect { left: 0, top: 0, right: 1920, bottom: 1080 };
+//! // Crop 8 px off the left edge, extend 8 px past the right edge.
+//! let offsets = Offsets { left: 8, top: 0, right: 8, bottom: 0 };
+//! let r = target_rect(monitor, offsets);
+//! assert_eq!((r.left, r.right), (8, 1928));
+//! ```
 
+/// Style bits removed to make a window borderless:
 /// CAPTION|SYSMENU|THICKFRAME|MINIMIZEBOX|MAXIMIZEBOX
 pub const STYLE_REMOVE: u32 = 0x00CF_0000;
+/// Extended-style bits removed to make a window borderless:
 /// DLGMODALFRAME|WINDOWEDGE|CLIENTEDGE|STATICEDGE|TOOLWINDOW|APPWINDOW|LAYERED|COMPOSITED
 pub const EXSTYLE_REMOVE: u32 = 0x020E_0381;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+/// Rectangle in physical pixels; `right` and `bottom` are exclusive.
 pub struct Rect {
+    /// Left edge.
     pub left: i32,
+    /// Top edge.
     pub top: i32,
+    /// Right edge (exclusive).
     pub right: i32,
+    /// Bottom edge (exclusive).
     pub bottom: i32,
 }
 
 impl Rect {
+    /// `right - left`, saturating.
     pub fn width(&self) -> i32 {
-        self.right - self.left
+        self.right.saturating_sub(self.left)
     }
+    /// `bottom - top`, saturating.
     pub fn height(&self) -> i32 {
-        self.bottom - self.top
+        self.bottom.saturating_sub(self.top)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(default)]
+/// Per-edge adjustment of a monitor rectangle, in physical pixels. Missing fields default to 0.
+///
+/// `left`/`top` move the origin inward and shrink the size; `right`/`bottom` grow the size.
 pub struct Offsets {
+    /// Pixels cropped from the left edge.
     pub left: i32,
+    /// Pixels cropped from the top edge.
     pub top: i32,
+    /// Pixels added past the right edge.
     pub right: i32,
+    /// Pixels added past the bottom edge.
     pub bottom: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+/// Snapshot of a window taken before it was made borderless; restoring replays it verbatim.
 pub struct WindowState {
+    /// Window handle value.
     pub hwnd: isize,
+    /// Original `GWL_STYLE` bits.
     pub style: u32,
+    /// Original `GWL_EXSTYLE` bits.
     pub exstyle: u32,
+    /// Original outer rectangle.
     pub rect: Rect,
+    /// Whether the window was maximized.
     pub maximized: bool,
 }
 
-pub fn has_targetable_style(style: u32) -> bool {
-    style & STYLE_REMOVE != 0
-}
-
+/// Returns `(style, exstyle)` with [`STYLE_REMOVE`] / [`EXSTYLE_REMOVE`] bits cleared.
+/// Idempotent; other bits are untouched.
+///
+/// ```
+/// use borderless_shatter::window_state::{borderless_styles, STYLE_REMOVE};
+///
+/// let (style, ex) = borderless_styles(0x1000_0000 | STYLE_REMOVE, 0);
+/// assert_eq!((style, ex), (0x1000_0000, 0));
+/// ```
 pub fn borderless_styles(style: u32, exstyle: u32) -> (u32, u32) {
     (style & !STYLE_REMOVE, exstyle & !EXSTYLE_REMOVE)
 }
 
+/// Rectangle a window occupies on `monitor` after applying `offsets` (see [`Offsets`]).
 pub fn target_rect(monitor: Rect, offsets: Offsets) -> Rect {
-    let x = monitor.left + offsets.left;
-    let y = monitor.top + offsets.top;
-    let w = monitor.width() - offsets.left + offsets.right;
-    let h = monitor.height() - offsets.top + offsets.bottom;
+    let x = monitor.left.saturating_add(offsets.left);
+    let y = monitor.top.saturating_add(offsets.top);
+    let w = monitor
+        .width()
+        .saturating_sub(offsets.left)
+        .saturating_add(offsets.right);
+    let h = monitor
+        .height()
+        .saturating_sub(offsets.top)
+        .saturating_add(offsets.bottom);
     Rect {
         left: x,
         top: y,
-        right: x + w,
-        bottom: y + h,
+        right: x.saturating_add(w),
+        bottom: y.saturating_add(h),
     }
-}
-
-/// `None` or an out-of-range index falls back to `current`.
-pub fn pick_monitor(monitors: &[Rect], current: Rect, index: Option<usize>) -> Rect {
-    index
-        .and_then(|i| monitors.get(i).copied())
-        .unwrap_or(current)
 }
 
 #[cfg(test)]
@@ -104,12 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn targetable_style() {
-        assert!(has_targetable_style(0x14CF0000));
-        assert!(!has_targetable_style(0x14000000));
-    }
-
-    #[test]
     fn target_rect_zero_offsets_is_monitor() {
         let m = R(0, 0, 1920, 1080);
         assert_eq!(target_rect(m, Offsets::default()), m);
@@ -142,12 +198,17 @@ mod tests {
     }
 
     #[test]
-    fn pick_monitor_cases() {
-        let ms = [R(0, 0, 10, 10), R(10, 0, 20, 10)];
-        let cur = R(1, 1, 2, 2);
-        assert_eq!(pick_monitor(&ms, cur, None), cur);
-        assert_eq!(pick_monitor(&ms, cur, Some(1)), ms[1]);
-        assert_eq!(pick_monitor(&ms, cur, Some(2)), cur);
+    fn extreme_offsets_do_not_panic() {
+        for v in [i32::MAX, i32::MIN] {
+            let o = Offsets {
+                left: v,
+                top: v,
+                right: v,
+                bottom: v,
+            };
+            let _ = target_rect(R(i32::MIN, i32::MIN, i32::MAX, i32::MAX), o);
+            let _ = target_rect(R(0, 0, 1920, 1080), o);
+        }
     }
 
     #[test]
