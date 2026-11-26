@@ -75,48 +75,63 @@ impl Server {
     }
 
     #[tool(description = D_LIST_WINDOWS)]
-    async fn list_windows(&self, p: Parameters<ipc::ListWindowsParams>) -> CallToolResult {
-        self.forward("list_windows", p.0).await
+    async fn list_windows(
+        &self,
+        p: Parameters<ipc::Strict<ipc::ListWindowsParams>>,
+    ) -> CallToolResult {
+        self.forward("list_windows", p.0.0).await
     }
 
     #[tool(description = D_APPLY)]
-    async fn apply(&self, p: Parameters<ipc::ApplyParams>) -> CallToolResult {
-        self.forward("apply", p.0).await
+    async fn apply(&self, p: Parameters<ipc::Strict<ipc::ApplyParams>>) -> CallToolResult {
+        self.forward("apply", p.0.0).await
     }
 
     #[tool(description = D_PLACE)]
-    async fn place(&self, p: Parameters<ipc::PlaceParams>) -> CallToolResult {
-        self.forward("place", p.0).await
+    async fn place(&self, p: Parameters<ipc::Strict<ipc::PlaceParams>>) -> CallToolResult {
+        self.forward("place", p.0.0).await
     }
 
     #[tool(description = D_RESTORE)]
-    async fn restore(&self, p: Parameters<ipc::RestoreParams>) -> CallToolResult {
-        self.forward("restore", p.0).await
+    async fn restore(&self, p: Parameters<ipc::Strict<ipc::RestoreParams>>) -> CallToolResult {
+        self.forward("restore", p.0.0).await
     }
 
     #[tool(description = D_RESTORE_ALL)]
-    async fn restore_all(&self, p: Parameters<ipc::RestoreAllParams>) -> CallToolResult {
-        self.forward("restore_all", p.0).await
+    async fn restore_all(
+        &self,
+        p: Parameters<ipc::Strict<ipc::RestoreAllParams>>,
+    ) -> CallToolResult {
+        self.forward("restore_all", p.0.0).await
     }
 
     #[tool(description = D_LIST_ISLANDS)]
-    async fn list_islands(&self, p: Parameters<ipc::ListIslandsParams>) -> CallToolResult {
-        self.forward("list_islands", p.0).await
+    async fn list_islands(
+        &self,
+        p: Parameters<ipc::Strict<ipc::ListIslandsParams>>,
+    ) -> CallToolResult {
+        self.forward("list_islands", p.0.0).await
     }
 
     #[tool(description = D_GET_PROFILES)]
-    async fn get_profiles(&self, p: Parameters<ipc::GetProfilesParams>) -> CallToolResult {
-        self.forward("get_profiles", p.0).await
+    async fn get_profiles(
+        &self,
+        p: Parameters<ipc::Strict<ipc::GetProfilesParams>>,
+    ) -> CallToolResult {
+        self.forward("get_profiles", p.0.0).await
     }
 
     #[tool(description = D_SET_PROFILES)]
-    async fn set_profiles(&self, p: Parameters<ipc::SetProfilesParams>) -> CallToolResult {
-        self.forward("set_profiles", p.0).await
+    async fn set_profiles(
+        &self,
+        p: Parameters<ipc::Strict<ipc::SetProfilesParams>>,
+    ) -> CallToolResult {
+        self.forward("set_profiles", p.0.0).await
     }
 
     #[tool(description = D_DIAGNOSE)]
-    async fn diagnose(&self, p: Parameters<ipc::DiagnoseParams>) -> CallToolResult {
-        self.forward("diagnose", p.0).await
+    async fn diagnose(&self, p: Parameters<ipc::Strict<ipc::DiagnoseParams>>) -> CallToolResult {
+        self.forward("diagnose", p.0.0).await
     }
 }
 
@@ -741,6 +756,21 @@ mod tests {
             ("set_profiles", r#"{"profiles":"x"}"#),
             ("set_profiles", r#"{"remove_layouts":[1,2]}"#),
             ("list_windows", r#"{"include_hidden":"yes"}"#),
+            // An array where the schema has an object: never a positional struct.
+            ("apply", r#"{"window":[1]}"#),
+            ("apply", r#"{"window":{"hwnd":1},"offsets":[1,2,3,4]}"#),
+            (
+                "place",
+                r#"{"window":{"hwnd":1},"island":"a/b","game_resolution":[1280,720]}"#,
+            ),
+            (
+                "set_profiles",
+                r#"{"profiles":[{"process":"a.exe","offsets":[1,2,3,4]}]}"#,
+            ),
+            (
+                "set_profiles",
+                r#"{"layouts":[{"id":"l","monitor":0,"islands":[{"id":"i","rect":[0,0,1,1]}]}]}"#,
+            ),
         ];
         for (i, (name, args)) in cases.into_iter().enumerate() {
             let id = i + 1;

@@ -200,6 +200,14 @@ fn hello_and_protocol_errors() {
     let v = exchange("{\"id\":\"abc\",\"method\":\"hello\"}\n");
     assert_eq!(v["id"], "abc", "{v}");
     assert_eq!(v["result"]["protocol"], 2, "{v}");
+    // A repeated key is `invalid_params`; a repeated `id` is answered with id 0.
+    let v = exchange("{\"id\":5,\"id\":6,\"method\":\"hello\"}\n");
+    assert_eq!(v["id"], 0, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_params", "{v}");
+    // An array where params has an object is never a positional struct.
+    let v = exchange("{\"id\":7,\"method\":\"restore\",\"params\":{\"window\":[1]}}\n");
+    assert_eq!(v["id"], 7, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_params", "{v}");
 }
 
 /// Creates real windows (resident); see module docs.

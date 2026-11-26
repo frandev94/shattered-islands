@@ -25,6 +25,7 @@ use borderless_shatter::window_state::{
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -1061,10 +1062,11 @@ fn arb_set_profiles() -> impl Strategy<Value = SetProfilesParams> {
 }
 
 /// `p` survives `to_value` → `parse_params`, `encode` → `decode_request` → `parse_params`, and an
-/// extra unknown field.
+/// extra unknown field. Since `parse_params` runs the schema walk, this is also P1: every valid
+/// params value passes it.
 fn params_roundtrip<T>(p: &T) -> Result<(), TestCaseError>
 where
-    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    T: Serialize + DeserializeOwned + JsonSchema + PartialEq + std::fmt::Debug,
 {
     let v = serde_json::to_value(p).unwrap();
     prop_assert_eq!(&ipc::parse_params::<T>(v.clone()).unwrap(), p);
@@ -1082,6 +1084,50 @@ where
         prop_assert_eq!(&ipc::parse_params::<T>(Value::Object(o)).unwrap(), p);
     }
     Ok(())
+}
+
+/// JSON Pointers of every object node of `v`, root (`""`) included.
+fn object_pointers(v: &Value, at: &str, out: &mut Vec<String>) {
+    match v {
+        Value::Object(o) => {
+            out.push(at.to_owned());
+            for (k, c) in o {
+                object_pointers(c, &format!("{at}/{k}"), out);
+            }
+        }
+        Value::Array(a) => {
+            for (i, c) in a.iter().enumerate() {
+                object_pointers(c, &format!("{at}/{i}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// P2: replacing one struct node of `p` by the array of its values is `invalid_params`, reported
+/// at that node. Every object in these generated params is a typed struct: extras hold scalars.
+fn positional_struct_is_rejected<T>(p: &T, pick: prop::sample::Index) -> Result<(), TestCaseError>
+where
+    T: Serialize + DeserializeOwned + JsonSchema + std::fmt::Debug,
+{
+    let mut v = serde_json::to_value(p).unwrap();
+    let mut pointers = Vec::new();
+    object_pointers(&v, "", &mut pointers);
+    let at = pick.get(&pointers).clone();
+    let node = v.pointer_mut(&at).unwrap();
+    let values = node.as_object().unwrap().values().cloned().collect();
+    *node = Value::Array(values);
+    let e = ipc::parse_params::<T>(v.clone()).unwrap_err();
+    prop_assert_eq!(e.code, ErrorCode::InvalidParams, "{}", v);
+    let want = format!("unexpected array at \"{at}\"");
+    prop_assert!(e.message.contains(&want), "{}: {}", v, e.message);
+    Ok(())
+}
+
+/// `s` as a JSON string literal with every UTF-16 unit escaped (`\uXXXX`).
+fn escaped(s: &str) -> String {
+    let units: String = s.encode_utf16().map(|u| format!("\\u{u:04x}")).collect();
+    format!("\"{units}\"")
 }
 
 proptest! {
@@ -1151,6 +1197,71 @@ proptest! {
     fn set_profiles_params_roundtrip(p in arb_set_profiles()) { params_roundtrip(&p)?; }
     #[test]
     fn window_ref_roundtrip(w in arb_window_ref()) { params_roundtrip(&w)?; }
+
+    #[test]
+    fn apply_rejects_a_positional_struct(p in arb_apply(), i in any::<prop::sample::Index>()) {
+        positional_struct_is_rejected(&p, i)?;
+    }
+    #[test]
+    fn place_rejects_a_positional_struct(p in arb_place(), i in any::<prop::sample::Index>()) {
+        positional_struct_is_rejected(&p, i)?;
+    }
+    #[test]
+    fn restore_rejects_a_positional_struct(w in arb_window_ref(), i in any::<prop::sample::Index>()) {
+        positional_struct_is_rejected(&RestoreParams { window: w }, i)?;
+    }
+    #[test]
+    fn diagnose_rejects_a_positional_struct(p in arb_diagnose(), i in any::<prop::sample::Index>()) {
+        positional_struct_is_rejected(&p, i)?;
+    }
+    #[test]
+    fn set_profiles_rejects_a_positional_struct(p in arb_set_profiles(), i in any::<prop::sample::Index>()) {
+        positional_struct_is_rejected(&p, i)?;
+    }
+
+    /// P1 for extras: arrays inside unknown fields of profiles, layouts and islands are kept, and
+    /// an unknown top-level array is ignored.
+    #[test]
+    fn set_profiles_accepts_arrays_in_extras(p in arb_set_profiles(), extra in vec(json_value(), 0..3)) {
+        let mut v = serde_json::to_value(&p).unwrap();
+        let arr = Value::Array(extra);
+        let put = |o: &mut Value| { o["_arr"] = arr.clone(); };
+        for profile in v.get_mut("profiles").and_then(Value::as_array_mut).into_iter().flatten() {
+            put(profile);
+        }
+        for layout in v.get_mut("layouts").and_then(Value::as_array_mut).into_iter().flatten() {
+            put(layout);
+            for island in layout.get_mut("islands").and_then(Value::as_array_mut).into_iter().flatten() {
+                put(island);
+            }
+        }
+        let mut sent = v.clone();
+        sent["zz_unknown"] = arr.clone();
+        let back: SetProfilesParams = ipc::parse_params(sent).unwrap();
+        prop_assert_eq!(serde_json::to_value(&back).unwrap(), v);
+    }
+
+    /// P3: a key repeated in params or in the envelope is `invalid_params`, also when the second
+    /// copy is fully `\u`-escaped; distinct keys are accepted.
+    #[test]
+    fn repeated_keys_are_invalid_params(
+        k in text(), k2 in text(), a in json_value(), b in json_value(), escape in any::<bool>(),
+    ) {
+        let key = serde_json::to_string(&k).unwrap();
+        let dup = if escape { escaped(&k) } else { key.clone() };
+        let (a, b) = (a.to_string(), b.to_string());
+        for line in [
+            format!(r#"{{"id":1,"method":"m","params":{{{key}:{a},{dup}:{b}}}}}"#),
+            format!(r#"{{{key}:{a},{dup}:{b},"id":1,"method":"m"}}"#),
+        ] {
+            let e = ipc::decode_request(&line).unwrap_err();
+            prop_assert_eq!(e.code, ErrorCode::InvalidParams, "{}", line);
+        }
+        prop_assume!(k != k2);
+        let key2 = serde_json::to_string(&k2).unwrap();
+        let line = format!(r#"{{"id":1,"method":"m","params":{{{key}:{a},{key2}:{b}}}}}"#);
+        prop_assert!(ipc::decode_request(&line).is_ok(), "{}", line);
+    }
 
     #[test]
     fn hex_is_fixed_width_lowercase(v in any::<u32>()) {

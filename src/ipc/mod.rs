@@ -13,12 +13,17 @@
 //! assert_eq!(line, "{\"id\":1,\"result\":{\"protocol\":2}}\n");
 //! // A request that is not an object is `invalid_params`, never a silent positional parse.
 //! assert_eq!(decode_request("[1,\"hello\"]").unwrap_err().code, ErrorCode::InvalidParams);
+//! // So is a repeated key: no "last one wins".
+//! assert_eq!(decode_request(r#"{"id":1,"id":2,"method":"hello"}"#).unwrap_err().code, ErrorCode::InvalidParams);
 //! ```
 
 pub mod pipe;
 
-use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -123,7 +128,8 @@ pub struct Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    /// The request or its params are well-formed JSON but have the wrong shape or values.
+    /// The request or its params are well-formed JSON but have the wrong shape or values,
+    /// including a key repeated in one object and an array where the schema allows none.
     InvalidParams,
     /// The method name is not supported.
     UnknownMethod,
@@ -230,7 +236,8 @@ pub fn encode(msg: &impl Serialize) -> Result<String, IpcError> {
 }
 
 /// Parse one request line. Syntax problems are `invalid_json`; a well-formed JSON
-/// that is not a request (not an object, missing `id`/`method`, wrong types) is `invalid_params`.
+/// that is not a request (not an object, a key repeated in any object, missing `id`/`method`,
+/// wrong types) is `invalid_params`.
 pub fn decode_request(line: &str) -> Result<Request, ErrorBody> {
     let line = line.trim_end_matches(['\r', '\n']);
     if line.len() > MAX_LINE {
@@ -242,6 +249,11 @@ pub fn decode_request(line: &str) -> Result<Request, ErrorBody> {
     let error = |code, e: serde_json::Error| ErrorBody::new(code, format!("invalid request: {e}"));
     // Parse to `Value` first so syntax and depth errors are `invalid_json` whatever the shape.
     let value: Value = serde_json::from_str(line).map_err(|e| error(ErrorCode::InvalidJson, e))?;
+    // `Value` keeps the last of repeated keys; RFC 8259 allows them, so they are a shape error.
+    let mut de = serde_json::Deserializer::from_str(line);
+    UniqueKeys::deserialize(&mut de)
+        .and_then(|_| de.end())
+        .map_err(|e| error(ErrorCode::InvalidParams, e))?;
     // Derived struct deserialisers also accept a positional array; requests are objects only.
     if value.is_array() {
         return Err(error(ErrorCode::InvalidParams, not_an_object()));
@@ -250,17 +262,223 @@ pub fn decode_request(line: &str) -> Result<Request, ErrorBody> {
 }
 
 /// Deserialise a method's `params` (`null`/absent is treated as `{}`; unknown fields are ignored).
-pub fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, ErrorBody> {
-    let invalid = |e: serde_json::Error| {
-        ErrorBody::new(ErrorCode::InvalidParams, format!("invalid params: {e}"))
-    };
+/// An array where `T`'s schema allows none (a positional struct) is `invalid_params`.
+pub fn parse_params<T: DeserializeOwned + JsonSchema>(params: Value) -> Result<T, ErrorBody> {
+    let invalid =
+        |e: String| ErrorBody::new(ErrorCode::InvalidParams, format!("invalid params: {e}"));
     let params = match params {
         Value::Null => Value::Object(Default::default()),
-        // Same positional-array leniency as in `decode_request`.
-        Value::Array(_) => return Err(invalid(not_an_object())),
         p => p,
     };
-    serde_json::from_value(params).map_err(invalid)
+    check_arrays::<T>(&params).map_err(invalid)?;
+    serde_json::from_value(params).map_err(|e| invalid(e.to_string()))
+}
+
+/// `T` decoded with the array rule of [`parse_params`], for MCP tool arguments (rmcp decodes them
+/// before the pipe sees anything). Its schema is exactly `T`'s.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Strict<T>(pub T);
+
+impl<'de, T: DeserializeOwned + JsonSchema> Deserialize<'de> for Strict<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(d)?;
+        check_arrays::<T>(&value).map_err(de::Error::custom)?;
+        T::deserialize(value).map(Strict).map_err(de::Error::custom)
+    }
+}
+
+impl<T: JsonSchema> JsonSchema for Strict<T> {
+    fn inline_schema() -> bool {
+        T::inline_schema()
+    }
+    fn schema_name() -> Cow<'static, str> {
+        T::schema_name()
+    }
+    fn schema_id() -> Cow<'static, str> {
+        T::schema_id()
+    }
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        T::json_schema(generator)
+    }
+}
+
+/// Checks a JSON document without building it: fails on the first key repeated in one object
+/// (compared after unescaping).
+struct UniqueKeys;
+
+impl<'de> Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(UniqueKeys)
+    }
+}
+
+impl<'de> Visitor<'de> for UniqueKeys {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(self)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if seen.contains(&key) {
+                return Err(de::Error::custom(format_args!("duplicate key {key:?}")));
+            }
+            map.next_value::<UniqueKeys>()?;
+            seen.insert(key);
+        }
+        Ok(self)
+    }
+}
+
+/// Longest `$ref` chain followed; no params type is recursive today.
+const MAX_REF_HOPS: usize = 32;
+
+/// Rejects a JSON array wherever `T`'s published schema allows none, naming its JSON Pointer.
+fn check_arrays<T: JsonSchema>(value: &Value) -> Result<(), String> {
+    // shortcut: schema regenerated per call, cache by TypeId if parse_params becomes hot.
+    let schema = SchemaGenerator::default().into_root_schema_for::<T>();
+    let root = schema.as_value();
+    walk_schema(root, &[root], value, &mut String::new())
+}
+
+/// Checks `value` against the union of `schemas`. Arrays descend through `items`; objects through
+/// `properties[key]` or a schema-valued `additionalProperties`. A key no schema describes
+/// (unknown, or extra under `additionalProperties: true`) is not checked.
+fn walk_schema(
+    root: &Value,
+    schemas: &[&Value],
+    value: &Value,
+    at: &mut String,
+) -> Result<(), String> {
+    let mut leaves = Vec::new();
+    for s in schemas {
+        schema_leaves(root, s, 0, &mut leaves)?;
+    }
+    match value {
+        Value::Array(items) => {
+            let allowing: Vec<&Value> = leaves.into_iter().filter(|l| admits(l, "array")).collect();
+            if allowing.is_empty() {
+                return Err(format!("unexpected array at \"{at}\""));
+            }
+            // A leaf without `items` (e.g. `true`) constrains nothing below.
+            let item: Option<Vec<&Value>> = allowing.iter().map(|l| l.get("items")).collect();
+            if let Some(item) = item {
+                for (i, v) in items.iter().enumerate() {
+                    walk_child(root, &item, v, at, &i.to_string())?;
+                }
+            }
+        }
+        Value::Object(fields) => {
+            let allowing: Vec<&Value> =
+                leaves.into_iter().filter(|l| admits(l, "object")).collect();
+            for (k, v) in fields {
+                let field: Option<Vec<&Value>> = allowing
+                    .iter()
+                    .map(|l| {
+                        l.get("properties")
+                            .and_then(|p| p.get(k))
+                            .or_else(|| l.get("additionalProperties").filter(|a| a.is_object()))
+                    })
+                    .collect();
+                // `Some(empty)`: no leaf allows an object here, and serde rejects it anyway.
+                if let Some(field) = field.filter(|f| !f.is_empty()) {
+                    let token = k.replace('~', "~0").replace('/', "~1");
+                    walk_child(root, &field, v, at, &token)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// [`walk_schema`] one level down, with `token` appended to the pointer `at`.
+fn walk_child(
+    root: &Value,
+    schemas: &[&Value],
+    value: &Value,
+    at: &mut String,
+    token: &str,
+) -> Result<(), String> {
+    let len = at.len();
+    at.push('/');
+    at.push_str(token);
+    walk_schema(root, schemas, value, at)?;
+    at.truncate(len);
+    Ok(())
+}
+
+/// Leaf schemas of `s`: `$ref` (`#/…`) followed, `anyOf`/`oneOf` flattened into their union.
+fn schema_leaves<'a>(
+    root: &'a Value,
+    s: &'a Value,
+    hops: usize,
+    out: &mut Vec<&'a Value>,
+) -> Result<(), String> {
+    if let Some(r) = s.get("$ref").and_then(Value::as_str) {
+        let target = r
+            .strip_prefix('#')
+            .and_then(|p| root.pointer(p))
+            .filter(|_| hops < MAX_REF_HOPS)
+            .ok_or_else(|| format!("unresolved schema reference {r:?}"))?;
+        return schema_leaves(root, target, hops + 1, out);
+    }
+    let branches: Vec<&Value> = ["anyOf", "oneOf"]
+        .iter()
+        .filter_map(|k| s.get(k).and_then(Value::as_array))
+        .flatten()
+        .collect();
+    if branches.is_empty() {
+        out.push(s);
+    }
+    for b in branches {
+        schema_leaves(root, b, hops, out)?;
+    }
+    Ok(())
+}
+
+/// Whether the leaf schema allows a value of JSON type `kind` (`"array"` or `"object"`). A schema
+/// with no `type`, `const` or `enum` (`true`, `serde_json::Value`) is unconstrained.
+fn admits(leaf: &Value, kind: &str) -> bool {
+    let of_kind = |v: &Value| match kind {
+        "array" => v.is_array(),
+        _ => v.is_object(),
+    };
+    match leaf {
+        Value::Object(o) => match (o.get("type"), o.get("const"), o.get("enum")) {
+            (Some(t), _, _) => {
+                t == kind || t.as_array().is_some_and(|ts| ts.iter().any(|t| t == kind))
+            }
+            (None, Some(c), _) => of_kind(c),
+            (None, None, Some(e)) => e.as_array().is_some_and(|vs| vs.iter().any(of_kind)),
+            (None, None, None) => true,
+        },
+        Value::Bool(b) => *b,
+        _ => true,
+    }
 }
 
 fn not_an_object() -> serde_json::Error {
@@ -809,6 +1027,214 @@ mod tests {
                 .code,
             ErrorCode::InvalidParams
         );
+    }
+
+    fn code_of(line: &str) -> ErrorCode {
+        decode_request(line).expect_err(line).code
+    }
+
+    #[test]
+    fn duplicate_envelope_key_is_invalid_params() {
+        assert_eq!(
+            code_of(r#"{"id":1,"id":2,"method":"hello"}"#),
+            ErrorCode::InvalidParams
+        );
+        assert_eq!(
+            code_of(r#"{"id":1,"method":"a","method":"b"}"#),
+            ErrorCode::InvalidParams
+        );
+    }
+
+    #[test]
+    fn duplicate_nested_key_is_invalid_params() {
+        assert_eq!(
+            code_of(r#"{"id":1,"method":"apply","params":{"window":{"hwnd":1,"hwnd":2}}}"#),
+            ErrorCode::InvalidParams
+        );
+        assert_eq!(
+            code_of(
+                r#"{"id":1,"method":"set_profiles","params":{"layouts":[{"id":"l","monitor":0,
+                "islands":[{"id":"i","id":"j","rect":{"x":0,"y":0,"w":1,"h":1}}]}]}}"#
+            ),
+            ErrorCode::InvalidParams
+        );
+        // Inside an unknown field too.
+        assert_eq!(
+            code_of(r#"{"id":1,"method":"m","x":[{"k":1,"k":1}]}"#),
+            ErrorCode::InvalidParams
+        );
+    }
+
+    #[test]
+    fn keys_equal_after_unescaping_are_duplicates() {
+        assert_eq!(
+            code_of(r#"{"id":1,"method":"m","params":{"a":1,"\u0061":2}}"#),
+            ErrorCode::InvalidParams
+        );
+        // Distinct keys are fine, at any depth.
+        let r =
+            decode_request(r#"{"id":1,"method":"m","params":{"a":{"a":1},"b":[{"a":1},{"a":2}]}}"#)
+                .expect("distinct keys");
+        assert_eq!(r.params["b"][1]["a"], 2);
+    }
+
+    #[test]
+    fn syntax_errors_win_over_duplicate_keys() {
+        for line in [
+            r#"{"id":1,"id":2,"method":"m""#,
+            r#"{"id":1,"id":2,"method":"m",}"#,
+            r#"{"id":1,"id":2,"method":"m"} x"#,
+        ] {
+            assert_eq!(code_of(line), ErrorCode::InvalidJson, "{line}");
+        }
+    }
+
+    /// `params` is `invalid_params` because of the schema walk, which names the array's pointer.
+    fn rejected<T: DeserializeOwned + JsonSchema + std::fmt::Debug>(params: Value, at: &str) {
+        let e = parse_params::<T>(params.clone()).expect_err(&params.to_string());
+        assert_eq!(e.code, ErrorCode::InvalidParams, "{params}");
+        let want = format!("unexpected array at \"{at}\"");
+        assert!(e.message.contains(&want), "{params}: {}", e.message);
+    }
+
+    fn accepted<T: DeserializeOwned + JsonSchema>(params: Value) -> T {
+        parse_params::<T>(params.clone()).unwrap_or_else(|e| panic!("{params}: {}", e.message))
+    }
+
+    /// A minimal valid island for the `set_profiles` cases.
+    fn island() -> Value {
+        json!({"id": "i", "rect": {"x": 0, "y": 0, "w": 1, "h": 1}})
+    }
+
+    #[test]
+    fn array_in_place_of_a_struct_is_invalid_params() {
+        let w = json!({"hwnd": 1});
+        // `$ref` into `$defs` (`WindowRef`).
+        rejected::<ApplyParams>(json!({"window": [1]}), "/window");
+        rejected::<PlaceParams>(json!({"window": [1], "island": "a/b"}), "/window");
+        rejected::<RestoreParams>(json!({"window": [1]}), "/window");
+        rejected::<DiagnoseParams>(json!({"window": [1]}), "/window");
+        // `$ref` inside `anyOf` (`Option<Struct>`).
+        rejected::<ApplyParams>(json!({"window": w, "offsets": [1, 2, 3, 4]}), "/offsets");
+        rejected::<PlaceParams>(
+            json!({"window": w, "island": "a/b", "game_resolution": [1280, 720]}),
+            "/game_resolution",
+        );
+        // Structs inside list items.
+        rejected::<SetProfilesParams>(
+            json!({"profiles": [{"process": "a.exe", "offsets": [1, 2, 3, 4]}]}),
+            "/profiles/0/offsets",
+        );
+        rejected::<SetProfilesParams>(
+            json!({"profiles": [{"process": "a.exe", "game_resolution": [1, 2]}]}),
+            "/profiles/0/game_resolution",
+        );
+        rejected::<SetProfilesParams>(
+            json!({"layouts": [{"id": "l", "monitor": 0, "islands": [{"id": "i", "rect": [0, 0, 1, 1]}]}]}),
+            "/layouts/0/islands/0/rect",
+        );
+        // The whole params.
+        rejected::<RestoreParams>(json!([{"hwnd": 5}]), "");
+    }
+
+    #[test]
+    fn array_where_a_non_object_is_expected_is_invalid_params() {
+        let w = json!({"hwnd": 1});
+        // `MonitorSel`: manual `anyOf` of integer and string, plain and inside `Option`.
+        rejected::<ApplyParams>(json!({"window": w, "monitor": [0]}), "/monitor");
+        rejected::<DiagnoseParams>(json!({"window": w, "monitor": ["primary"]}), "/monitor");
+        rejected::<SetProfilesParams>(
+            json!({"layouts": [{"id": "l", "monitor": [0], "islands": []}]}),
+            "/layouts/0/monitor",
+        );
+        // `MonitorChoice`: manual `oneOf`.
+        rejected::<SetProfilesParams>(
+            json!({"profiles": [{"process": "a.exe", "monitor": [0]}]}),
+            "/profiles/0/monitor",
+        );
+        // `Unit`: `oneOf` of `const`.
+        let mut i = island();
+        i["rect"]["unit"] = json!(["px"]);
+        rejected::<SetProfilesParams>(
+            json!({"layouts": [{"id": "l", "monitor": 0, "islands": [i]}]}),
+            "/layouts/0/islands/0/rect/unit",
+        );
+        // Scalars: a plain `type`, a type list (`["integer","null"]`) and a field of a `$ref`.
+        rejected::<PlaceParams>(json!({"window": w, "island": ["a/b"]}), "/island");
+        rejected::<ApplyParams>(json!({"window": {"hwnd": [1]}}), "/window/hwnd");
+        rejected::<PlaceParams>(
+            json!({"window": w, "island": "a/b", "game_resolution": {"width": [1], "height": 2}}),
+            "/game_resolution/width",
+        );
+    }
+
+    #[test]
+    fn list_items_must_have_their_own_shape() {
+        rejected::<SetProfilesParams>(json!({"profiles": [["a.exe"]]}), "/profiles/0");
+        rejected::<SetProfilesParams>(json!({"layouts": [["l", 0, []]]}), "/layouts/0");
+        rejected::<SetProfilesParams>(
+            json!({"layouts": [{"id": "l", "monitor": 0, "islands": [["i"]]}]}),
+            "/layouts/0/islands/0",
+        );
+        rejected::<SetProfilesParams>(json!({"remove": [["a.exe"]]}), "/remove/0");
+        rejected::<SetProfilesParams>(json!({"remove_layouts": [["l"]]}), "/remove_layouts/0");
+    }
+
+    #[test]
+    fn pointer_escapes_tilde_and_slash() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct Odd {
+            #[serde(rename = "a/b~c")]
+            _x: Offsets,
+        }
+        rejected::<Odd>(json!({"a/b~c": [1]}), "/a~1b~0c");
+    }
+
+    #[test]
+    fn maps_check_their_values() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct WithMaps {
+            #[serde(default)]
+            typed: std::collections::BTreeMap<String, Offsets>,
+            #[serde(default)]
+            any: serde_json::Map<String, Value>,
+        }
+        rejected::<WithMaps>(json!({"typed": {"k": [1, 2, 3, 4]}}), "/typed/k");
+        let m: WithMaps = accepted(json!({"typed": {"k": {"left": 1}}, "any": {"k": [1, [2]]}}));
+        assert_eq!(m.typed["k"].left, 1);
+        assert_eq!(m.any["k"], json!([1, [2]]));
+    }
+
+    #[test]
+    fn objects_nulls_lists_and_extras_are_still_accepted() {
+        let w = json!({"hwnd": 1});
+        accepted::<ApplyParams>(json!({"window": w, "offsets": {"left": 1}, "monitor": "primary"}));
+        accepted::<ApplyParams>(json!({"window": w, "monitor": 0}));
+        let a: ApplyParams = accepted(json!({
+            "window": w, "offsets": null, "monitor": null, "game_resolution": null, "island": null
+        }));
+        assert_eq!((a.offsets, a.monitor, a.island), (None, None, None));
+        accepted::<PlaceParams>(json!({"window": w, "island": "a/b", "game_resolution": null}));
+        accepted::<PlaceParams>(
+            json!({"window": w, "island": "a/b", "game_resolution": {"width": 1, "height": 2}}),
+        );
+        let mut i = island();
+        i["_x"] = json!([1, {"k": [2]}]);
+        let p: SetProfilesParams = accepted(json!({
+            "profiles": [{"process": "a.exe", "monitor": "current", "offsets": {"top": 2},
+                          "game_resolution": {"width": 1, "height": 2}, "_x": [[1]]}],
+            "layouts": [{"id": "l", "monitor": "primary", "islands": [i], "_y": [{"a": []}]}],
+            "remove": ["b.exe"],
+            "remove_layouts": ["m"],
+            "unknown": [1, [2], {"k": []}]
+        }));
+        assert_eq!(p.profiles.expect("profiles")[0].extra["_x"], json!([[1]]));
+        assert_eq!(
+            p.layouts.expect("layouts")[0].islands[0].extra["_x"],
+            json!([1, {"k": [2]}])
+        );
+        accepted::<SetProfilesParams>(json!({"profiles": null, "layouts": null, "remove": null}));
+        accepted::<DiagnoseParams>(json!({"window": {"process": "a.exe"}, "extra": [1]}));
     }
 
     #[test]
