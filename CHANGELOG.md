@@ -2,6 +2,36 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] - 2026-11-26
+
+### 🐛 Bug Fixes
+
+- *(ipc)* Reject duplicate keys and arrays where objects are expected
+- *(ipc)* Validate params of parameterless methods and shorten duplicate-key errors
+
+### 📚 Documentation
+
+- Add dark and light header banners
+- Describe what main does, add banner, process diagram and roadmap
+- Thicken the banner's main crack
+- Draw every reader of settings.json in the process diagram
+- Add AGENTS.md and the manual release steps (#36)
+- Document the e2e workflow and the local fallback
+- Correct the e2e order and trigger paths
+- Add the agent release rule to AGENTS.md
+- Describe strict IPC decoding
+- List the nullable params fields
+
+### 🧪 Testing
+
+- *(e2e)* Expect profiles.json.prev after the first save
+- *(e2e)* Add a session probe for hosted runners
+- *(e2e)* Force a client size that fits small runner screens
+
+### ⚙️ Miscellaneous Tasks
+
+- *(e2e)* Run the window suites on windows-latest
+- *(e2e)* Run the probe contract tests and bound the suite step
 ## [0.2.2] - 2026-11-26
 
 ### 🐛 Bug Fixes
