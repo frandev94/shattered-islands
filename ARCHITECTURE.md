@@ -96,8 +96,8 @@ Reference for every client. All coordinates are physical pixels; hexadecimal sty
 **Strict decoding.** Applies to every request line and to MCP tool arguments.
 
 - A key repeated in any object of the line (envelope, `params`, nested at any depth, unknown fields included) is `invalid_params`. Keys are compared after JSON escapes are decoded. The response `id` is `0` when the repeated key is the top-level `id`; otherwise it is the request's `id`. A syntax error takes precedence: a broken line is `invalid_json`.
-- An array where the schema expects an object (`window`, `offsets`, `game_resolution`, `rect`, and any other struct at any depth) is `invalid_params`. Arrays are accepted only where the method table shows a list (`remove`, `remove_layouts`, `profiles`, `layouts`, `islands`) and inside unknown or extra fields. `null` is accepted for optional fields.
-- Unknown fields are still ignored.
+- An array where the schema expects an object (`window`, `offsets`, `game_resolution`, `rect`, and any other struct at any depth) is `invalid_params`. Arrays are accepted only where the method table shows a list (`remove`, `remove_layouts`, `profiles`, `layouts`, `islands`) and inside unknown or extra fields. `null` is accepted only where the field is nullable (`offsets`, `monitor`, `game_resolution`, `island`, `delay_ms`, `hwnd`, `process`, `title`, `profiles`, `layouts`, `remove`, `expected_revision`); elsewhere (`use_profile`, `observe_ms`, `keep`, `include_hidden`, `remove_layouts`, `replace_extras`, …) it is `invalid_params`. A whole `params` of `null` or absent means `{}`.
+- Unknown fields are still ignored. Every method, including `hello`, `restore_all`, `list_islands` and `get_profiles`, validates `params` this way: a non-object `params` is `invalid_params`.
 - Over MCP, the array rule is a tool error (`isError: true`, `failed to deserialize parameters: …`) and the call never reaches the resident. Repeated keys are not detected over MCP: rmcp collapses them before the tool sees `arguments`.
 - Responses are produced only by the engine, and clients decode them without this rigidity.
 
