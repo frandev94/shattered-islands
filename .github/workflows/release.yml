@@ -9,7 +9,7 @@ name: release
 #   build (read)    version, Cargo.toml/Cargo.lock/CHANGELOG.md, exe and .sha256 from that SHA; uploads them.
 #   publish (write) never compiles: checks the uploaded files hold only the release edits, commits them, tags,
 #                   and only its last step sees the token.
-# Windows runners bill 2x on a private repo: only test and build run there (the exe is built on Windows).
+# Only test and build run on Windows runners (the exe is built on Windows).
 on:
   push:
     branches: [main]

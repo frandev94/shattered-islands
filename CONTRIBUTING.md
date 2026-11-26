@@ -113,6 +113,6 @@ Never move or delete a pushed tag; a wrong release gets a new release.
 ## Clean-room and licence
 
 Shattered Islands is a clean-room implementation: no code or text from GPL projects is copied, and behaviour
-is documented from public sources. The project is MIT. Never copy or translate code or text from Borderless
+is documented from public sources. The project is MIT, so never copy or translate code or text from Borderless
 Gaming (GPL-2.0), ihateborders (GPL-3.0) or Zed's GPL crates, and do not add dependencies whose licence
 `cargo deny` rejects.

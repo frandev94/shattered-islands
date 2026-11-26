@@ -4,9 +4,9 @@
 
 Borderless Shatter is a free alternative to **Borderless Gaming**: a Windows tool that forces game windows into borderless fullscreen. It takes ideas from the open-source edition of Borderless Gaming (C# WinForms, GPL-2.0, up to 9.6.0): https://github.com/andrewmd5/Borderless-Gaming
 
-**Current phase: v0.2** (core + islands + frameless windows + IPC + GUI with GPUI + MCP server + CLI + English/Spanish i18n; the IPC protocol and design constraints are in `ARCHITECTURE.md`). Next: keyboard shortcuts to move the active window to an island (v0.3). The implementation language is **Rust**: modern, small exe with no runtime, and it can later produce the native DLL an injected graphics component needs. A clean Rust design also avoids inheriting the GPL-2.0 of the open-source 9.6.0.
+The resident is a tray process that owns the managed-window state; the GUI panel, the MCP server and the CLI are clients of its named pipe. Current features: core engine, islands, frameless windows, IPC, GUI with GPUI, MCP server, CLI and English/Spanish i18n; the IPC protocol and design constraints are in `ARCHITECTURE.md`. Roadmap: keyboard shortcuts to move the active window to an island. The implementation language is **Rust**: modern, small exe with no runtime.
 
-Licensed **MIT**, so the code is a clean-room implementation.
+Shattered Islands is a clean-room implementation: no code or text from GPL projects is copied, and behaviour is documented from public sources.
 
 ## Architecture & Data Flow
 
@@ -25,7 +25,7 @@ Short map; module roles, the event loop, the IPC protocol, data files and invari
 
 | Path | Purpose |
 |---|---|
-| `docs/` | `GAMES.md`: per-game results, organised by engine and use case. |
+| `docs/` | `GAMES.md` (per-game results, organised by engine and use case) and the two banner SVGs (`banner-dark.svg`, `banner-light.svg`). |
 | `ARCHITECTURE.md`, `CONTRIBUTING.md` | Code organisation; build, test and contribution rules. |
 | `locales/` | i18n catalogs: `en/` (source of truth) and `es/`, one JSON file per area. |
 | `tests/`, `examples/testwin.rs` | Integration suites and the fake game window they drive. |
@@ -49,17 +49,17 @@ borderless-shatter.exe list-windows        # CLI; see `borderless-shatter help` 
 
 ## Code Conventions & Common Patterns
 
-- **Errors**: `Win32Error` (thiserror, `win32/`) and `ProfileError` (`profiles.rs`) are typed. `anyhow` appears only at the app edge (`main.rs`, `engine.rs`, `tray.rs`). Non-test code has no `unwrap`/`expect`; tests may unwrap.
-- **Unsafe**: confined to Win32 calls and FFI callbacks (`win32/`, `watcher.rs`, `main.rs`, `ipc/pipe.rs`, `diagnose.rs`, `engine.rs`, `tray.rs`, `gui/`). Each unsafe site carries a `// SAFETY:` comment. FFI callbacks only filter, collect or post; they do no other work.
+- **Errors**: `Win32Error` (thiserror, `win32/`) and `ProfileError` (`profiles.rs`) are typed. `anyhow` appears only in `gui/mod.rs`, `mcp.rs` and `tray.rs`. Non-test code has no `unwrap`/`expect`; tests may unwrap.
+- **Unsafe**: confined to Win32 calls and FFI callbacks (`win32/`, `watcher.rs`, `ipc/pipe.rs`, `diagnose.rs`, `engine.rs`, `tray.rs`, `gui/`, `cli.rs`, `mcp.rs`, `i18n.rs`). Each unsafe site carries a `// SAFETY:` comment. FFI callbacks only filter, collect or post; they do no other work.
 - **Handles**: `HWND` crosses module and state boundaries as `isize` via `win32::hwnd_to_isize` / `hwnd_from_isize`. Kernel handles we own (the single-instance mutex, process handles) are wrapped in `OwnedHandle`, which calls `CloseHandle` on drop.
 - **Pure logic**: style masks, rect math and profile parsing/matching live in `window_state.rs` and `profiles.rs`, which import no `windows` types. Their unit tests sit in `#[cfg(test)]` modules in the same files.
-- **Event handling**: no `thread::sleep`. Delayed work is armed with `SetTimer` on the message-only window (`win32::set_timer`) and killed on its first `WM_TIMER`. The wndproc only queues events (plus killing that timer); the main loop drains the queue after each dispatch.
+- **Event handling**: the resident's message-loop thread never calls `thread::sleep`. Delayed work is armed with `SetTimer` on the message-only window (`win32::set_timer`) and killed on its first `WM_TIMER`. The wndproc only queues events (plus killing that timer); the main loop drains the queue after each dispatch.
 - **Restore**: `Engine::capture` records original style, ex-style, rect and maximized state before any style or position change (the only earlier touch is `SW_RESTORE` on maximized or iconic windows, to read the normal rect). `restore` attempts every step even after a failure, always forgets the window, and returns the first error.
 - **Language and i18n**: the language is `BORDERLESS_SHATTER_LANG` > `settings.json` (`language`: `system`, `en`, `es`; written only by the panel) > the OS UI language. Code, identifiers, comments, commit messages and product docs are in English. User-facing text (GUI, tray, CLI output) goes through the i18n catalogs: English is the default and the source of truth, Spanish is the second shipped language, and a missing key falls back to English; never hard-code a user-facing string. MCP tool descriptions and the engine's `ErrorBody.message` stay English only (they are protocol); clients match error codes, never message text.
 
 ## Runtime/Tooling
 
-- **Rust stable**, host `x86_64-pc-windows-msvc` (MSVC linker from the VS 2019 Build Tools). Run `cargo fmt` and `cargo clippy` before commits.
+- **Rust**: the channel pinned in `rust-toolchain.toml` (with `rustfmt` and `clippy`), host `x86_64-pc-windows-msvc`; the MSVC toolchain and linker are required. Run `cargo fmt` and `cargo clippy` before commits.
 
 ## Testing & QA
 
@@ -96,6 +96,6 @@ Win32 smoke scripts live outside the repo.
 
 ## Hard Rules
 
-- **No GPL code.** The project is MIT. Borderless Gaming (GPL-2.0, https://github.com/andrewmd5/Borderless-Gaming) and ihateborders (GPL-3.0, https://github.com/Z1xus/ihateborders, Rust) may be read for behaviour and facts (Win32 calls, flags, order, pitfalls), never copied or closely paraphrased: no code, comments or file layout. Cite them as references in notes, not in source.
+- **No GPL code.** Shattered Islands is a clean-room implementation: no code or text from GPL projects is copied, and behaviour is documented from public sources. The project is MIT. Borderless Gaming (GPL-2.0, https://github.com/andrewmd5/Borderless-Gaming) and ihateborders (GPL-3.0, https://github.com/Z1xus/ihateborders, Rust) may be consulted for behaviour and facts (Win32 calls, flags, order, pitfalls), never copied or closely paraphrased: no code, comments or file layout. Cite them as references in notes, not in source.
 - **Keep project docs current.** When behaviour, the protocol, a design constraint or test results change, update the matching file in the same change: `README.md` (usage, profiles), `ARCHITECTURE.md` (code organisation, IPC protocol, design constraints), `CONTRIBUTING.md` (build, test, contribution rules), `docs/GAMES.md` (per-game results). `CHANGELOG.md` is generated by git-cliff at release time; never edit it by hand. These files describe the product, never the working method.
 - **English in the repo.** Every file in the repo is written in English except the Spanish i18n catalog.
