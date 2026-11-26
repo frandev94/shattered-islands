@@ -585,6 +585,11 @@ pub struct SetProfilesParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Reject with `revision_conflict` unless the file still has this revision.
     pub expected_revision: Option<String>,
+    /// Store every sent profile, layout and island exactly as sent, dropping unknown fields it
+    /// does not repeat. When `false` (the default), a replaced item keeps its old unknown fields
+    /// unless it brings its own (islands matched by `id` in the replaced layout).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_extras: bool,
 }
 
 /// Answer of `set_profiles`.

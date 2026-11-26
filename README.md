@@ -122,7 +122,7 @@ File: `%APPDATA%\BorderlessShatter\profiles.json`. If it does not exist, it is c
 | `delay_ms` | number | `0` | Wait in milliseconds before applying (at most 60000) |
 | `clip_cursor` | boolean | `false` | Accepted and ignored |
 
-Fields this version does not know are kept when the file is saved.
+Fields this version does not know are kept when the file is saved, at the file level and inside each profile, layout and island (not inside `rect`, `offsets`, `game_resolution` or `monitor`). Saving from the panel keeps them. When `set_profiles` replaces a profile, layout or island, it keeps the old unknown fields unless the new item brings its own; islands are matched by `id`. To remove them, send the items without them and `"replace_extras": true`: each sent item is stored exactly as sent, and items not sent are untouched.
 
 ## Islands
 

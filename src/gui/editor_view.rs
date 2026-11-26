@@ -856,6 +856,7 @@ impl EditorView {
             id,
             monitor: MonitorSel::Primary,
             islands: Vec::new(),
+            extra: Default::default(),
         });
         self.pick = Some(Pick::Draft(self.draft.len() - 1));
         self.sel = None;
@@ -910,6 +911,7 @@ impl EditorView {
                 l.islands.push(Island {
                     id,
                     rect: rect_from_px(&ZERO_RECT, target, mw, mh),
+                    extra: Default::default(),
                 });
             }
         });
@@ -2290,8 +2292,10 @@ mod tests {
                         h: 0.5,
                         unit: Unit::Fraction,
                     },
+                    extra: Default::default(),
                 })
                 .collect(),
+            extra: Default::default(),
         }
     }
 

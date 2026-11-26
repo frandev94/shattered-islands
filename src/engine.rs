@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -1896,9 +1896,20 @@ impl Engine {
     }
 
     fn set_profiles(&mut self, p: SetProfilesParams) -> Result<SetProfilesResult, ErrorBody> {
-        let path = self.profiles_path()?;
+        let (file, result) = Self::apply_set_profiles(&self.profiles_path()?, p)?;
+        self.profiles = file;
+        self.profiles_revision = result.revision.clone();
+        self.menu_dirty = true;
+        Ok(result)
+    }
+
+    /// The file side of `set_profiles`: load → revision check → upsert → validate → save.
+    fn apply_set_profiles(
+        path: &Path,
+        p: SetProfilesParams,
+    ) -> Result<(ProfileFile, SetProfilesResult), ErrorBody> {
         // An invalid file on disk is reported, never overwritten: the user can fix a hand edit.
-        let (mut file, revision) = profiles::load(&path).map_err(profile_err)?;
+        let (mut file, revision) = profiles::load(path).map_err(profile_err)?;
         if p.expected_revision
             .as_ref()
             .is_some_and(|exp| *exp != revision)
@@ -1919,6 +1930,7 @@ impl Engine {
             p.layouts.unwrap_or_default(),
             p.remove.unwrap_or_default(),
             p.remove_layouts,
+            p.replace_extras,
         );
         let warnings = profiles::validate(&file);
         // Invalid combinations in what this call wrote are rejected; older findings stay warnings.
@@ -1942,13 +1954,10 @@ impl Engine {
                     .with_data(json!({ "warnings": rejected })),
             );
         }
-        profiles::save_atomic(&path, &file).map_err(profile_err)?;
-        let bytes = std::fs::read(&path).map_err(|e| profile_err(e.into()))?;
+        profiles::save_atomic(path, &file).map_err(profile_err)?;
+        let bytes = std::fs::read(path).map_err(|e| profile_err(e.into()))?;
         let revision = profiles::revision(&bytes);
-        self.profiles = file;
-        self.profiles_revision = revision.clone();
-        self.menu_dirty = true;
-        Ok(SetProfilesResult { revision, warnings })
+        Ok((file, SetProfilesResult { revision, warnings }))
     }
 }
 
@@ -2374,5 +2383,118 @@ mod tests {
         assert!(!res.restored);
         assert!(engine.managed.is_empty());
         assert_eq!(win32::get_styles(h).unwrap(), before);
+    }
+
+    const SET_PROFILES_FILE: &str = r#"{"version":2,
+      "layouts":[
+        {"id":"l","monitor":0,"_l":1,"islands":[
+          {"id":"i","_i":1,"rect":{"x":0,"y":0,"w":0.5,"h":1}},
+          {"id":"j","_j":1,"rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]},
+        {"id":"u","monitor":0,"_u":1,"islands":[
+          {"id":"i","_ui":1,"rect":{"x":0,"y":0,"w":1,"h":1}}]}],
+      "profiles":[{"process":"a.exe","_p":1},{"process":"b.exe","_b":1}]}"#;
+
+    /// IPC params text → `parse_params` → `apply_set_profiles` on a `SET_PROFILES_FILE` copy;
+    /// returns the call's result and the file bytes afterwards.
+    fn set_profiles_call(
+        tag: &str,
+        params: &str,
+    ) -> (Result<SetProfilesResult, ErrorBody>, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("bs-engine-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profiles.json");
+        std::fs::write(&path, SET_PROFILES_FILE).unwrap();
+        let p: SetProfilesParams =
+            crate::ipc::parse_params(serde_json::from_str(params).unwrap()).unwrap();
+        let res = Engine::apply_set_profiles(&path, p).map(|(_, r)| r);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (res, bytes)
+    }
+
+    /// IPC params text → `parse_params` → `apply_set_profiles` → the saved file as JSON.
+    fn set_profiles_saved(tag: &str, params: &str) -> Value {
+        let (res, bytes) = set_profiles_call(tag, params);
+        res.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn set_profiles_stale_expected_revision_is_a_conflict_and_leaves_the_file() {
+        let (res, bytes) = set_profiles_call(
+            "stale",
+            r#"{"expected_revision":"stale","profiles":[{"process":"c.exe"}]}"#,
+        );
+        assert_eq!(res.unwrap_err().code, ErrorCode::RevisionConflict);
+        assert_eq!(bytes, SET_PROFILES_FILE.as_bytes());
+    }
+
+    #[test]
+    fn set_profiles_blocking_warning_is_rejected_and_leaves_the_file() {
+        let (res, bytes) = set_profiles_call(
+            "reject",
+            r#"{"layouts":[{"id":"l","monitor":0,"islands":[
+                {"id":"i","rect":{"x":0,"y":0,"w":0.5,"h":1}},
+                {"id":"i","rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]}]}"#,
+        );
+        let e = res.unwrap_err();
+        assert_eq!(e.code, ErrorCode::ProfileError);
+        let data = e.data.unwrap();
+        let codes: Vec<&str> = data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert_eq!(codes, ["duplicate_island"]);
+        assert_eq!(bytes, SET_PROFILES_FILE.as_bytes());
+    }
+
+    #[test]
+    fn set_profiles_returns_the_revision_of_the_saved_file() {
+        let before = profiles::revision(SET_PROFILES_FILE.as_bytes());
+        let (res, bytes) = set_profiles_call(
+            "revision",
+            &format!(r#"{{"expected_revision":"{before}","profiles":[{{"process":"c.exe"}}]}}"#),
+        );
+        let revision = res.unwrap().revision;
+        assert_ne!(revision, before);
+        assert_eq!(revision, profiles::revision(&bytes));
+    }
+
+    #[test]
+    fn set_profiles_replace_extras_stores_sent_items_as_sent() {
+        let v = set_profiles_saved(
+            "replace",
+            r#"{"replace_extras":true,
+              "layouts":[{"id":"l","monitor":0,"islands":[
+                {"id":"i","rect":{"x":0,"y":0,"w":0.5,"h":1}},
+                {"id":"j","rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]}],
+              "profiles":[{"process":"a.exe"}]}"#,
+        );
+        assert!(v["layouts"][0].get("_l").is_none());
+        assert!(v["layouts"][0]["islands"][0].get("_i").is_none());
+        assert!(v["layouts"][0]["islands"][1].get("_j").is_none());
+        assert!(v["profiles"][0].get("_p").is_none());
+        assert_eq!(v["layouts"][1]["_u"], 1);
+        assert_eq!(v["layouts"][1]["islands"][0]["_ui"], 1);
+        assert_eq!(v["profiles"][1]["_b"], 1);
+    }
+
+    #[test]
+    fn set_profiles_without_replace_extras_carries_extras_over() {
+        let v = set_profiles_saved(
+            "carry",
+            r#"{"layouts":[{"id":"l","monitor":0,"islands":[
+                {"id":"i","rect":{"x":0,"y":0,"w":0.5,"h":1}},
+                {"id":"j","rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]}],
+              "profiles":[{"process":"a.exe"}]}"#,
+        );
+        assert_eq!(v["layouts"][0]["_l"], 1);
+        assert_eq!(v["layouts"][0]["islands"][0]["_i"], 1);
+        assert_eq!(v["layouts"][0]["islands"][1]["_j"], 1);
+        assert_eq!(v["profiles"][0]["_p"], 1);
+        assert_eq!(v["layouts"][1]["_u"], 1);
+        assert_eq!(v["profiles"][1]["_b"], 1);
     }
 }

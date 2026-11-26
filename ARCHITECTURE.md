@@ -146,7 +146,7 @@ write `<file>.tmp`, `sync_all`, then rename, so a reader or a power cut sees the
 
 | File | Location | Safety rules |
 |---|---|---|
-| `profiles.json` | `%APPDATA%` | Version 2, shared by all instances. Saved atomically; the replaced file is kept as `profiles.json.prev` (best effort). A v1 file is first copied to `profiles.v1.bak`, once. `revision` is the SHA-256 of the bytes; `set_profiles` with a stale `expected_revision` fails with `revision_conflict`. Invalid JSON is never overwritten. Unknown fields are kept. UTF-8 BOM accepted; UTF-16 refused with an error. |
+| `profiles.json` | `%APPDATA%` | Version 2, shared by all instances. Saved atomically; the replaced file is kept as `profiles.json.prev` (best effort). A v1 file is first copied to `profiles.v1.bak`, once. `revision` is the SHA-256 of the bytes; `set_profiles` with a stale `expected_revision` fails with `revision_conflict`. Invalid JSON is never overwritten. Unknown fields are kept at file, profile, layout and island level (not inside `rect`, `offsets`, `game_resolution` or `monitor`); a `set_profiles` replacement keeps the old unknown fields of a profile, layout or island unless the new item brings its own (islands matched by `id`), and `replace_extras: true` stores each sent item exactly as sent. UTF-8 BOM accepted; UTF-16 refused with an error. |
 | `settings.json` | `%APPDATA%` | Version 1, at most 64 KiB, BOM accepted, unknown fields kept, atomic save. |
 | `state.json` | `%LOCALAPPDATA%` | `state.<suffix>.json` for an isolated instance. Saved on every change of the managed set. A file that cannot be read is kept and moved to `state.json.bad` before the next save (replacing an older `.bad`); while the move fails nothing is written. |
 

@@ -125,6 +125,9 @@ pub struct Island {
     pub id: String,
     /// Where the island sits on the monitor.
     pub rect: IslandRect,
+    /// Fields this version does not know, written back unchanged.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -136,6 +139,9 @@ pub struct Layout {
     pub monitor: MonitorSel,
     /// The islands of this layout.
     pub islands: Vec<Island>,
+    /// Fields this version does not know, written back unchanged.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -204,11 +210,13 @@ pub fn presets() -> Vec<Layout> {
             h: 1.0,
             unit: Unit::Fraction,
         },
+        extra: Default::default(),
     };
     vec![Layout {
         id: "halves-16-9".into(),
         monitor: MonitorSel::Primary,
         islands: vec![half("left", 0.0), half("right", 0.5)],
+        extra: Default::default(),
     }]
 }
 
@@ -501,11 +509,13 @@ mod tests {
                 id: "halves-16-9".into(),
                 monitor: MonitorSel::Index(0),
                 islands: vec![],
+                extra: Default::default(),
             },
             Layout {
                 id: "other".into(),
                 monitor: MonitorSel::Primary,
                 islands: vec![],
+                extra: Default::default(),
             },
         ];
         let merged = merged_layouts(&user);
@@ -533,12 +543,15 @@ mod tests {
                 Island {
                     id: "izquierda".into(), // legacy alias test
                     rect: frac(0.0, 0.0, 0.4, 1.0),
+                    extra: Default::default(),
                 },
                 Island {
                     id: "derecha".into(), // legacy alias test
                     rect: frac(0.4, 0.0, 0.6, 1.0),
+                    extra: Default::default(),
                 },
             ],
+            extra: Default::default(),
         }
     }
 
@@ -555,6 +568,7 @@ mod tests {
             id: "halves-16-9".into(),
             monitor: MonitorSel::Index(1),
             islands: vec![],
+            extra: Default::default(),
         };
         for user in [
             vec![canonical.clone(), user_legacy_layout()],
@@ -619,7 +633,9 @@ mod tests {
             islands: vec![Island {
                 id: "right".into(),
                 rect: frac(0.0, 0.0, 1.0, 1.0),
+                extra: Default::default(),
             }],
+            extra: Default::default(),
         };
         let ls = merged_layouts(&[canonical, user_legacy_layout()]);
         assert_eq!(
@@ -640,7 +656,9 @@ mod tests {
             islands: vec![Island {
                 id: "right".into(),
                 rect: frac(0.0, 0.0, 1.0, 1.0),
+                extra: Default::default(),
             }],
+            extra: Default::default(),
         };
         let ls = merged_layouts(&[other]);
         assert!(matches!(

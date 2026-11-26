@@ -1090,17 +1090,20 @@ mod tests {
                 id: "a".into(),
                 monitor: MonitorSel::Primary,
                 islands: vec![],
+                extra: Default::default(),
             },
             Layout {
                 id: "d".into(),
                 monitor: MonitorSel::Index(7),
                 islands: vec![],
+                extra: Default::default(),
             },
             // Not listed but its monitor exists: not "missing", just not reported.
             Layout {
                 id: "x".into(),
                 monitor: MonitorSel::Primary,
                 islands: vec![],
+                extra: Default::default(),
             },
         ];
         let missing = missing_layouts(&profile, &layouts[..3], &monitors);
