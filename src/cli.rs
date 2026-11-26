@@ -1,4 +1,4 @@
-//! Command-line client (`borderless-shatter <subcommand>`, docs/V0.2.md "CLI"): one IPC request
+//! Command-line client (`borderless-shatter <subcommand>`): one IPC request
 //! per run, sent to the resident, which the CLI never starts. Exit codes: 0 ok (result JSON on
 //! stdout), 1 the resident answered `error` (`{"error":…}` on stdout), 2 usage error (stderr,
 //! resident not contacted), 3 resident unreachable / transport failure / protocol mismatch.

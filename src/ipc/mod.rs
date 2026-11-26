@@ -1,4 +1,4 @@
-//! IPC protocol (docs/V0.2.md "IPC protocol"): JSON-lines requests/responses and
+//! IPC protocol: JSON-lines requests/responses and
 //! the typed params/results of every method. Transport lives in [`pipe`].
 //!
 //! Every coordinate is in physical pixels. The same types back the MCP tool schemas

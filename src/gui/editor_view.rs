@@ -345,7 +345,7 @@ fn code_str(c: ErrorCode) -> String {
         .unwrap_or_default()
 }
 
-/// The engine refuses to write this file (D-08): the editor turns read-only.
+/// The engine refuses to write this file (invalid JSON or a newer version): the editor turns read-only.
 pub fn is_readonly(b: &ErrorBody) -> bool {
     matches!(
         b.code,
@@ -510,7 +510,7 @@ pub struct EditorView {
     loading: bool,
     busy: bool,
     load_error: Option<Problem>,
-    /// `profile_error` / `unsupported_version`: nothing can be saved (D-08).
+    /// `profile_error` / `unsupported_version`: nothing can be saved, the file on disk is kept as is.
     readonly: Option<Problem>,
     save_error: Option<Problem>,
     notice: Option<String>,

@@ -19,7 +19,7 @@ use crate::win32::{get_styles, hwnd_from_isize, window_rect};
 use crate::window_state::{Rect, STYLE_REMOVE};
 
 /// A deviation this long after our last write counts as a late revert, not part of the
-/// immediate fight (the `late-frame` pattern, D-09).
+/// immediate fight (the `late-frame` pattern: a game that restores its frame ~1500 ms later).
 const LATE_REVERT_MS: f64 = 1000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
