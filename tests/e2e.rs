@@ -404,11 +404,12 @@ fn set_profiles_writes_v2_with_revision() {
     let mut h = Harness::new("set_profiles_writes_v2_with_revision");
     let mut c = h.start_resident();
     let old = get_profiles(&mut c).revision;
+    let path = h.profiles_path();
+    let before = fs::read(&path).expect("profiles.json exists before the first save");
     let r = set_profiles(
         &mut c,
         json!({ "profiles": [{ "process": "e2e-fake.exe", "island": RIGHT }] }),
     );
-    let path = h.profiles_path();
     let bytes = fs::read(&path).expect("profiles.json written");
     assert_eq!(r.revision, sha256_hex(&bytes));
     let v: Value = serde_json::from_slice(&bytes).expect("profiles.json is JSON");
@@ -419,7 +420,10 @@ fn set_profiles_writes_v2_with_revision() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["profiles.json"]);
+    assert_eq!(names, ["profiles.json", "profiles.json.prev"]);
+    let prev = fs::read(path.with_file_name("profiles.json.prev")).expect("profiles.json.prev");
+    assert_eq!(prev, before);
+    assert_eq!(sha256_hex(&before), old);
 
     let e = call_err(
         &mut c,
