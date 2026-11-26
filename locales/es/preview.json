@@ -1,0 +1,8 @@
+{
+  "preview.fraction": "{w} % × {h} %",
+  "preview.window_fallback": "Ventana {hwnd}",
+  "preview.occupants": {
+    "one": "{n} ventana",
+    "other": "{n} ventanas"
+  }
+}

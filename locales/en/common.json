@@ -1,0 +1,22 @@
+{
+  "common.decimal_separator": ".",
+  "common.preset.halves-16-9": "Halves 16:9",
+  "common.error.invalid_params": "Borderless Shatter did not understand the request.",
+  "common.error.unknown_method": "Borderless Shatter did not understand the request.",
+  "common.error.invalid_json": "Borderless Shatter did not understand the request.",
+  "common.error.window_not_found": "The window no longer exists.",
+  "common.error.ambiguous_window": "Several windows match. Pick a specific one.",
+  "common.error.window_gone": "The window no longer exists.",
+  "common.error.access_denied": "That window can't be changed: it runs as administrator.",
+  "common.error.excluded_process": "That process is excluded and is left alone.",
+  "common.error.island_not_found": "The island no longer exists.",
+  "common.error.monitor_unavailable": "The monitor for that island is not available.",
+  "common.error.profile_error": "The profiles file could not be read.",
+  "common.error.revision_conflict": "The profiles changed in the meantime. Try again.",
+  "common.error.unsupported_version": "The profiles file could not be read.",
+  "common.error.win32_error": "Windows did not allow the window to be moved.",
+  "common.error.busy": "Borderless Shatter is busy with another action. Try again.",
+  "common.error.internal": "Borderless Shatter hit an internal error.",
+  "common.error.resident_unreachable": "Borderless Shatter is not running. Press \"Start\" in the sidebar.",
+  "common.error.transport_error": "The connection to Borderless Shatter was lost. Try again."
+}
