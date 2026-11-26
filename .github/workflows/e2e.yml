@@ -42,9 +42,11 @@ jobs:
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       # Also builds the examples the suites and the probe launch (testwin, session_probe).
       - run: cargo build --all-targets
+      - run: cargo test --example session_probe
       # One step so every command runs and reports even after a failure; the summary is written in
       # `finally` and the step fails at the end if anything did.
       - name: Probe the session, then run the suites twice
+        timeout-minutes: 75
         shell: python
         run: |
           import csv, hashlib, io, json, os, pathlib, re, subprocess, sys, traceback
