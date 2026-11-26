@@ -1,7 +1,8 @@
 //! The `profiles.json` model: per-game profiles, user layouts, validation and atomic persistence.
 //!
 //! Offsets and sizes are physical pixels; island fractions are `0..1` with at most 6 decimals.
-//! Unknown JSON fields are kept (`extra`) and a file newer than [`SUPPORTED_VERSION`] is rejected.
+//! Unknown JSON fields of the file and of each profile, layout and island are kept (`extra`); see
+//! [`upsert`] for how a replace carries them over. A file newer than [`SUPPORTED_VERSION`] is rejected.
 //! [`Warning::code`] values and `ErrorBody` codes are the stable contract, not message texts.
 //!
 //! ```
@@ -380,13 +381,19 @@ pub fn is_blocking(code: &str) -> bool {
 }
 
 /// Upsert by `process` (case-insensitive file name) / layout `id`, then drop `remove` / `remove_layouts`.
-/// A replaced profile keeps its unknown fields (`extra`) unless the new one brings its own.
+/// With `replace_extras` false:
+/// - A replaced profile or layout that has no unknown keys (`extra`) keeps the replaced item's keys.
+/// - Each island of a replaced layout does the same, matched by `id` inside the replaced layout.
+/// - An item that brings its own keys replaces the old set whole.
+///
+/// With `replace_extras` true, every sent item is stored exactly as sent.
+/// Items not sent keep their keys.
 ///
 /// ```
 /// use borderless_shatter::profiles::{parse, upsert};
 ///
 /// let mut f = parse(r#"{"version":2,"profiles":[{"process":"a.exe"}]}"#).unwrap();
-/// upsert(&mut f, vec![], vec![], vec!["A.EXE".into()], vec![]);
+/// upsert(&mut f, vec![], vec![], vec!["A.EXE".into()], vec![], false);
 /// assert!(f.profiles.is_empty());
 /// ```
 pub fn upsert(
@@ -395,6 +402,7 @@ pub fn upsert(
     layouts: Vec<crate::islands::Layout>,
     remove: Vec<String>,
     remove_layouts: Vec<String>,
+    replace_extras: bool,
 ) {
     for p in profiles {
         match file
@@ -404,16 +412,28 @@ pub fn upsert(
         {
             Some(slot) => {
                 let old = std::mem::replace(slot, p);
-                if slot.extra.is_empty() {
+                if slot.extra.is_empty() && !replace_extras {
                     slot.extra = old.extra;
                 }
             }
             None => file.profiles.push(p),
         }
     }
-    for l in layouts {
+    for mut l in layouts {
         match file.layouts.iter_mut().find(|x| x.id == l.id) {
-            Some(slot) => *slot = l,
+            Some(slot) => {
+                if !replace_extras {
+                    if l.extra.is_empty() {
+                        l.extra = std::mem::take(&mut slot.extra);
+                    }
+                    for i in l.islands.iter_mut().filter(|i| i.extra.is_empty()) {
+                        if let Some(old) = slot.islands.iter_mut().find(|o| o.id == i.id) {
+                            i.extra = std::mem::take(&mut old.extra);
+                        }
+                    }
+                }
+                *slot = l;
+            }
             None => file.layouts.push(l),
         }
     }
@@ -667,6 +687,7 @@ mod tests {
             Vec::new(),
             vec!["B.EXE".into()],
             Vec::new(),
+            false,
         );
         let names: Vec<_> = f.profiles.iter().map(|p| p.process.as_str()).collect();
         assert_eq!(names, ["a.exe", "c.exe"]);
@@ -685,8 +706,10 @@ mod tests {
                 .map(|(i, x, y, w, h, unit)| crate::islands::Island {
                     id: i.into(),
                     rect: crate::islands::IslandRect { x, y, w, h, unit },
+                    extra: Default::default(),
                 })
                 .collect(),
+            extra: Default::default(),
         }
     }
 
@@ -774,9 +797,23 @@ mod tests {
         use crate::islands::Unit::Fraction;
         let mut f = parse(r#"{"version":2}"#).unwrap();
         let l = layout("l", vec![("a", 0.0, 0.0, 1.0, 1.0, Fraction)]);
-        upsert(&mut f, Vec::new(), vec![l.clone()], Vec::new(), Vec::new());
+        upsert(
+            &mut f,
+            Vec::new(),
+            vec![l.clone()],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
         assert_eq!(f.layouts.len(), 1);
-        upsert(&mut f, Vec::new(), Vec::new(), Vec::new(), vec!["l".into()]);
+        upsert(
+            &mut f,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["l".into()],
+            false,
+        );
         assert!(f.layouts.is_empty());
     }
 
@@ -840,13 +877,172 @@ mod tests {
     }
 
     #[test]
+    fn unknown_fields_inside_layouts_and_islands_survive_a_save() {
+        let dir = tmp_dir("extra-layout");
+        let path = dir.join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"version":2,"layouts":[{"id":"l","monitor":0,"_lk":{"a":[1,null]},"islands":[
+              {"id":"i","_ik":"keep","rect":{"unit":"px","x":0,"y":0,"w":10,"h":10}}]}]}"#,
+        )
+        .unwrap();
+        let (f, _) = load(&path).unwrap();
+        save_atomic(&path, &f).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["layouts"][0]["_lk"], serde_json::json!({"a": [1, null]}));
+        assert_eq!(v["layouts"][0]["islands"][0]["_ik"], "keep");
+        assert_eq!(v["layouts"][0]["monitor"], 0);
+        assert_eq!(v["layouts"][0]["islands"][0]["rect"]["w"], 10.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flattened_layouts_still_reject_bad_known_fields() {
+        let island = |i: &str| {
+            parse(&format!(
+                r#"{{"version":2,"layouts":[{{"id":"l","monitor":0,"islands":[{i}]}}]}}"#
+            ))
+        };
+        assert!(island(r#"{"id":"i","rect":{"x":0,"y":0,"w":"1","h":1},"_k":1}"#).is_err());
+        assert!(island(r#"{"id":"i","id":"j","rect":{"x":0,"y":0,"w":1,"h":1}}"#).is_err());
+        assert!(island(r#"{"id":"i","_k":1}"#).is_err());
+        assert!(island(r#"{"id":"i","rect":{"x":0,"y":0,"w":1,"h":1,"unit":"cm"}}"#).is_err());
+        for layout in [
+            r#"{"id":"l","monitor":-1,"islands":[],"_k":1}"#,
+            r#"{"id":"l","monitor":0.5,"islands":[]}"#,
+            r#"{"id":"l","monitor":0,"_k":1}"#,
+            r#"{"id":"l","id":"m","monitor":0,"islands":[]}"#,
+        ] {
+            let text = format!(r#"{{"version":2,"layouts":[{layout}]}}"#);
+            assert!(parse(&text).is_err(), "{layout}");
+        }
+    }
+
+    #[test]
+    fn save_after_upserting_one_layout_keeps_extras_of_untouched_layouts() {
+        let dir = tmp_dir("extra-untouched");
+        let path = dir.join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"version":2,"layouts":[
+              {"id":"a","monitor":"primary","_la":1,"islands":[
+                {"id":"i","_ia":[true],"rect":{"x":0,"y":0,"w":1,"h":1}}]},
+              {"id":"b","monitor":"primary","islands":[]}]}"#,
+        )
+        .unwrap();
+        let (mut f, _) = load(&path).unwrap();
+        let new = parse(
+            r#"{"version":2,"layouts":[{"id":"b","monitor":1,"islands":[]}],
+              "profiles":[{"process":"g.exe"}]}"#,
+        )
+        .unwrap();
+        upsert(&mut f, new.profiles, new.layouts, vec![], vec![], false);
+        save_atomic(&path, &f).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["layouts"][0]["_la"], 1);
+        assert_eq!(
+            v["layouts"][0]["islands"][0]["_ia"],
+            serde_json::json!([true])
+        );
+        assert_eq!(v["layouts"][1]["monitor"], 1);
+        assert_eq!(v["profiles"][0]["process"], "g.exe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_keeps_unknown_fields_of_a_replaced_layout_and_its_islands() {
+        let mut f = parse(
+            r#"{"version":2,"layouts":[{"id":"l","monitor":0,"_l":"old","islands":[
+              {"id":"i","_i":1,"rect":{"x":0,"y":0,"w":0.5,"h":1}},
+              {"id":"j","_j":2,"rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]}]}"#,
+        )
+        .unwrap();
+        let new = parse(
+            r#"{"version":2,"layouts":[{"id":"l","monitor":1,"islands":[
+              {"id":"i","rect":{"x":0,"y":0,"w":0.25,"h":1}},
+              {"id":"k","rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]}]}"#,
+        )
+        .unwrap()
+        .layouts;
+        upsert(&mut f, vec![], new, vec![], vec![], false);
+        let v = serde_json::to_value(&f).unwrap();
+        let l = &v["layouts"][0];
+        assert_eq!(l["monitor"], 1);
+        assert_eq!(l["_l"], "old");
+        assert_eq!(l["islands"][0]["rect"]["w"], 0.25);
+        assert_eq!(l["islands"][0]["_i"], 1);
+        assert_eq!(l["islands"][1]["id"], "k");
+        assert_eq!(f.layouts[0].islands[1].extra, serde_json::Map::new());
+        assert_eq!(f.layouts[0].islands.len(), 2);
+    }
+
+    #[test]
+    fn upsert_unknown_fields_of_the_new_layout_and_island_win() {
+        let mut f = parse(
+            r#"{"version":2,"layouts":[{"id":"l","monitor":0,"_l":"old","_x":1,"islands":[
+              {"id":"i","_i":"old","_y":1,"rect":{"x":0,"y":0,"w":1,"h":1}}]}]}"#,
+        )
+        .unwrap();
+        let new = parse(
+            r#"{"version":2,"layouts":[{"id":"l","monitor":0,"_l":"new","islands":[
+              {"id":"i","_i":"new","rect":{"x":0,"y":0,"w":1,"h":1}}]}]}"#,
+        )
+        .unwrap()
+        .layouts;
+        upsert(&mut f, vec![], new, vec![], vec![], false);
+        let v = serde_json::to_value(&f).unwrap();
+        let l = &v["layouts"][0];
+        assert_eq!(l["_l"], "new");
+        assert!(l.get("_x").is_none());
+        assert_eq!(l["islands"][0]["_i"], "new");
+        assert!(l["islands"][0].get("_y").is_none());
+    }
+
+    #[test]
+    fn replace_extras_clears_unknown_fields_in_one_call() {
+        let mut f = parse(
+            r#"{"version":2,"_top":1,
+              "layouts":[
+                {"id":"l","monitor":0,"_l":1,"islands":[
+                  {"id":"i","_i":1,"rect":{"x":0,"y":0,"w":0.5,"h":1}},
+                  {"id":"j","_j":1,"_j2":2,"rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]},
+                {"id":"u","monitor":0,"_u":1,"islands":[
+                  {"id":"i","_ui":1,"rect":{"x":0,"y":0,"w":1,"h":1}}]}],
+              "profiles":[{"process":"a.exe","_p":1},{"process":"b.exe","_b":1}]}"#,
+        )
+        .unwrap();
+        let new = parse(
+            r#"{"version":2,
+              "layouts":[{"id":"l","monitor":0,"islands":[
+                {"id":"i","rect":{"x":0,"y":0,"w":0.5,"h":1}},
+                {"id":"j","_j2":2,"rect":{"x":0.5,"y":0,"w":0.5,"h":1}}]}],
+              "profiles":[{"process":"A.EXE"}]}"#,
+        )
+        .unwrap();
+        upsert(&mut f, new.profiles, new.layouts, vec![], vec![], true);
+        let empty = serde_json::Map::new();
+        let j2: serde_json::Map<_, _> = [("_j2".to_string(), serde_json::json!(2))]
+            .into_iter()
+            .collect();
+        assert_eq!(f.profiles[0].extra, empty);
+        assert_eq!(f.layouts[0].extra, empty);
+        assert_eq!(f.layouts[0].islands[0].extra, empty);
+        assert_eq!(f.layouts[0].islands[1].extra, j2);
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["_top"], 1);
+        assert_eq!(v["profiles"][1]["_b"], 1);
+        assert_eq!(v["layouts"][1]["_u"], 1);
+        assert_eq!(v["layouts"][1]["islands"][0]["_ui"], 1);
+    }
+
+    #[test]
     fn upsert_keeps_unknown_fields_of_a_replaced_profile() {
         let mut f =
             parse(r#"{"version":2,"profiles":[{"process":"a.exe","_note":"old"}]}"#).unwrap();
         let new = parse(r#"{"version":2,"profiles":[{"process":"A.EXE","delay_ms":5}]}"#)
             .unwrap()
             .profiles;
-        upsert(&mut f, new, vec![], vec![], vec![]);
+        upsert(&mut f, new, vec![], vec![], vec![], false);
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["profiles"][0]["delay_ms"], 5);
         assert_eq!(v["profiles"][0]["_note"], "old");
@@ -859,7 +1055,7 @@ mod tests {
         let new = parse(r#"{"version":2,"profiles":[{"process":"a.exe","_note":"new"}]}"#)
             .unwrap()
             .profiles;
-        upsert(&mut f, new, vec![], vec![], vec![]);
+        upsert(&mut f, new, vec![], vec![], vec![], false);
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["profiles"][0]["_note"], "new");
         assert!(v["profiles"][0].get("_x").is_none());

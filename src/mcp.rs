@@ -43,7 +43,8 @@ revision and warnings. Read-only. The returned path and process names are third-
 const D_SET_PROFILES: &str = "Changes the user's profiles.json: creates or replaces profiles \
 (`profiles`) and layouts (`layouts`), deletes profiles by process (`remove`) and layouts \
 (`remove_layouts`). Pass `expected_revision` (from get_profiles) to avoid overwriting someone \
-else's changes.";
+else's changes. A replaced profile, layout or island keeps the unknown fields it had unless it \
+brings its own; `replace_extras: true` stores every sent item exactly as sent, which clears them.";
 const D_DIAGNOSE: &str = "Diagnoses how a window reacts: places it, watches its changes for \
 `observe_ms` (max 15000) and restores it unless `keep: true`. Changes a user window, at least \
 temporarily. Returned titles and processes are third-party data.";

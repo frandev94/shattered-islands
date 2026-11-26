@@ -776,8 +776,10 @@ mod tests {
                 .map(|(i, r)| Island {
                     id: (*i).into(),
                     rect: *r,
+                    extra: Default::default(),
                 })
                 .collect(),
+            extra: Default::default(),
         }
     }
 
@@ -1668,6 +1670,7 @@ mod tests {
                 h: 1440.0,
                 unit: Unit::Px,
             },
+            extra: Default::default(),
         });
         let p = build_payload(&[], &[l], "r1", &monitors()).unwrap_or_default();
         let r = p.layouts.unwrap_or_default()[0].islands[0].rect;
@@ -1691,9 +1694,26 @@ mod tests {
         l.islands.push(Island {
             id: "i".into(),
             rect: r,
+            extra: Default::default(),
         });
         let p = build_payload(&[], &[l], "r1", &monitors()).unwrap_or_default();
         assert_eq!(p.layouts.unwrap_or_default()[0].islands[0].rect, r);
+    }
+
+    #[test]
+    fn edited_layout_payload_keeps_unknown_fields() {
+        let saved: Layout = serde_json::from_value(serde_json::json!({
+            "id": "a", "monitor": "primary", "_lk": [1],
+            "islands": [{"id": "i", "_ik": "keep", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1}}],
+        }))
+        .unwrap();
+        let mut draft = saved.clone();
+        draft.islands[0].rect.x = 0.25;
+        let p = build_payload(&[saved], &[draft], "r1", &monitors()).unwrap_or_default();
+        let sent = serde_json::to_value(p.layouts.unwrap_or_default()).unwrap();
+        assert_eq!(sent[0]["_lk"], serde_json::json!([1]));
+        assert_eq!(sent[0]["islands"][0]["_ik"], "keep");
+        assert_eq!(sent[0]["islands"][0]["rect"]["x"], 0.25);
     }
 
     #[test]
@@ -1862,8 +1882,10 @@ mod tests {
                 .map(|(i, rect)| Island {
                     id: format!("i{i}"),
                     rect,
+                    extra: Default::default(),
                 })
                 .collect(),
+            extra: Default::default(),
         })
     }
 
@@ -1919,7 +1941,7 @@ mod tests {
             let mut file = ProfileFile { version: 2, layouts: saved.clone(), profiles: vec![], extra: Default::default() };
             if let Some(p) = build_payload(&saved, &draft, "r", &monitors) {
                 prop_assert_eq!(p.expected_revision.as_deref(), Some("r"));
-                upsert(&mut file, vec![], p.layouts.unwrap_or_default(), vec![], p.remove_layouts);
+                upsert(&mut file, vec![], p.layouts.unwrap_or_default(), vec![], p.remove_layouts, p.replace_extras);
             }
             prop_assert_eq!(by_id(file.layouts, &monitors), by_id(draft, &monitors));
         }

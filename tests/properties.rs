@@ -108,8 +108,10 @@ fn valid_layouts() -> impl Strategy<Value = Vec<Layout>> {
                     .map(|(j, rect)| Island {
                         id: format!("i{j}"),
                         rect,
+                        extra: Default::default(),
                     })
                     .collect(),
+                extra: Default::default(),
             })
             .collect()
     })
@@ -131,19 +133,33 @@ fn arb_island_rect_any() -> impl Strategy<Value = IslandRect> {
     (g(), g(), g(), g(), unit()).prop_map(|(x, y, w, h, unit)| IslandRect { x, y, w, h, unit })
 }
 
+/// Unknown fields: no known field at any level starts with `_`; no floats (see the file header).
+fn arb_extra() -> impl Strategy<Value = serde_json::Map<String, Value>> {
+    let value = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::from),
+        any::<i64>().prop_map(Value::from),
+        any::<String>().prop_map(Value::from),
+    ];
+    proptest::collection::btree_map("_[a-z0-9]{1,6}", value, 0..3)
+        .prop_map(|m| m.into_iter().collect())
+}
+
 fn arb_layout_any() -> impl Strategy<Value = Layout> {
     (
         any::<String>(),
         arb_monitor_sel(),
-        vec((any::<String>(), arb_island_rect_any()), 0..4),
+        vec((any::<String>(), arb_island_rect_any(), arb_extra()), 0..4),
+        arb_extra(),
     )
-        .prop_map(|(id, monitor, islands)| Layout {
+        .prop_map(|(id, monitor, islands, extra)| Layout {
             id,
             monitor,
             islands: islands
                 .into_iter()
-                .map(|(id, rect)| Island { id, rect })
+                .map(|(id, rect, extra)| Island { id, rect, extra })
                 .collect(),
+            extra,
         })
 }
 
@@ -160,6 +176,7 @@ fn arb_profile() -> impl Strategy<Value = Profile> {
         any::<bool>(),
         proptest::option::of(any::<String>()),
         proptest::option::of(any_size()),
+        arb_extra(),
     )
         .prop_map(
             |(
@@ -171,6 +188,7 @@ fn arb_profile() -> impl Strategy<Value = Profile> {
                 clip_cursor,
                 island,
                 game_resolution,
+                extra,
             )| {
                 Profile {
                     process,
@@ -181,7 +199,7 @@ fn arb_profile() -> impl Strategy<Value = Profile> {
                     clip_cursor,
                     island,
                     game_resolution,
-                    extra: Default::default(),
+                    extra,
                 }
             },
         )
@@ -192,12 +210,13 @@ fn arb_file() -> impl Strategy<Value = ProfileFile> {
         0u32..=SUPPORTED_VERSION,
         vec(arb_layout_any(), 0..3),
         vec(arb_profile(), 0..3),
+        arb_extra(),
     )
-        .prop_map(|(version, layouts, profiles)| ProfileFile {
+        .prop_map(|(version, layouts, profiles, extra)| ProfileFile {
             version,
             layouts,
             profiles,
-            extra: Default::default(),
+            extra,
         })
 }
 
@@ -329,8 +348,10 @@ proptest! {
                         .map(|(&(li, ci), rect)| Island {
                             id: if legacy_islands { li } else { ci }.to_string(),
                             rect,
+                            extra: Default::default(),
                         })
                         .collect(),
+                    extra: Default::default(),
                 })
                 .collect();
             let layouts = islands::merged_layouts(&user_layouts);
@@ -694,7 +715,9 @@ fn one_island_layout(id: &str, island: &str, rect: IslandRect) -> Layout {
         islands: vec![Island {
             id: island.into(),
             rect,
+            extra: Default::default(),
         }],
+        extra: Default::default(),
     }
 }
 
@@ -741,6 +764,39 @@ proptest! {
         let pretty = serde_json::to_string_pretty(&file).unwrap();
         prop_assert_eq!(&profiles::parse(&compact).unwrap(), &file);
         prop_assert_eq!(&profiles::parse(&pretty).unwrap(), &file);
+    }
+
+    #[test]
+    fn upsert_extras_carry_over_or_replace(
+        mut file in arb_file(),
+        mut layout in arb_layout_any(),
+        mut profile in arb_profile(),
+        replace in any::<bool>(),
+    ) {
+        for (j, i) in layout.islands.iter_mut().enumerate() {
+            i.id = format!("i{j}");
+        }
+        profile.process = "target.exe".into();
+        file.layouts.retain(|l| l.id != layout.id);
+        file.profiles.retain(|p| {
+            !p.process.rsplit(['\\', '/']).next().unwrap_or("").eq_ignore_ascii_case("target.exe")
+        });
+        file.layouts.push(layout.clone());
+        file.profiles.push(profile.clone());
+        let mut sent_layout = layout;
+        sent_layout.extra.clear();
+        for i in &mut sent_layout.islands {
+            i.extra.clear();
+        }
+        let mut sent_profile = profile;
+        sent_profile.extra.clear();
+        let mut expected = file.clone();
+        if replace {
+            *expected.layouts.last_mut().unwrap() = sent_layout.clone();
+            *expected.profiles.last_mut().unwrap() = sent_profile.clone();
+        }
+        profiles::upsert(&mut file, vec![sent_profile], vec![sent_layout], vec![], vec![], replace);
+        prop_assert_eq!(file, expected);
     }
 
     #[test]
@@ -988,14 +1044,18 @@ fn arb_set_profiles() -> impl Strategy<Value = SetProfilesParams> {
         proptest::option::of(vec(any::<String>(), 0..3)),
         vec(any::<String>(), 0..3),
         proptest::option::of(any::<String>()),
+        any::<bool>(),
     )
         .prop_map(
-            |(profiles, layouts, remove, remove_layouts, expected_revision)| SetProfilesParams {
-                profiles,
-                layouts,
-                remove,
-                remove_layouts,
-                expected_revision,
+            |(profiles, layouts, remove, remove_layouts, expected_revision, replace_extras)| {
+                SetProfilesParams {
+                    profiles,
+                    layouts,
+                    remove,
+                    remove_layouts,
+                    expected_revision,
+                    replace_extras,
+                }
             },
         )
 }
