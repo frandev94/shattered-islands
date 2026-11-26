@@ -75,7 +75,7 @@ message (`ipc_handler` in `tray.rs`). Delays (apply delay, settle, re-assert) ar
   `src/ipc/pipe.rs`). The DACL is `D:P(A;;GA;;;<user SID>)`, a protected ACL for the current user only;
   remote clients are rejected, and the server's first instance uses `first_pipe_instance`, so a squatted
   pipe name is a hard error.
-- **Framing**: one JSON object per line, at most `MAX_LINE` (1 MiB). Methods and payloads live in
+- **Framing**: one JSON object per line, with unique keys at every level, at most `MAX_LINE` (1 MiB). Methods and payloads live in
   `ipc/mod.rs`; `hello` returns `PROTOCOL` (2) and clients refuse a different value.
 - **Errors**: `ErrorBody { code, message }`. Clients match `code`, never the English message; transport
   failures carry `os error N` instead of the localized OS text.
@@ -92,6 +92,14 @@ Reference for every client. All coordinates are physical pixels; hexadecimal sty
 **Envelope.** Request `{"id", "method", "params"?}`; response `{"id", "result"}` or `{"id", "error": {"code", "message", "data"?}}`. `id` is an integer or a string chosen by the client and returned unchanged. Several requests may be in flight; the engine serializes them. There are no server notifications: clients poll.
 
 **Common types.** `WindowRef` is `{"hwnd": n}` or `{"process": "game.exe", "title"?: "text"}` (`title` is a case-insensitive substring; several matches fail with `ambiguous_window` and `data.candidates`; `hwnd` is not stable across game runs). `Rect` is `{left, top, right, bottom}`. An island is referred to as `"layout/island"`. A monitor is an index, a device name (`\\.\DISPLAY1`) or `"primary"`.
+
+**Strict decoding.** Applies to every request line and to MCP tool arguments.
+
+- A key repeated in any object of the line (envelope, `params`, nested at any depth, unknown fields included) is `invalid_params`. Keys are compared after JSON escapes are decoded. The response `id` is `0` when the repeated key is the top-level `id`; otherwise it is the request's `id`. A syntax error takes precedence: a broken line is `invalid_json`.
+- An array where the schema expects an object (`window`, `offsets`, `game_resolution`, `rect`, and any other struct at any depth) is `invalid_params`. Arrays are accepted only where the method table shows a list (`remove`, `remove_layouts`, `profiles`, `layouts`, `islands`) and inside unknown or extra fields. `null` is accepted for optional fields.
+- Unknown fields are still ignored.
+- Over MCP, the array rule is a tool error (`isError: true`, `failed to deserialize parameters: …`) and the call never reaches the resident. Repeated keys are not detected over MCP: rmcp collapses them before the tool sees `arguments`.
+- Responses are produced only by the engine, and clients decode them without this rigidity.
 
 **Methods.** The MCP tools are these methods, same names and shapes, except `hello`.
 
@@ -116,7 +124,7 @@ Reference for every client. All coordinates are physical pixels; hexadecimal sty
 
 | `code` | When |
 |---|---|
-| `invalid_params`, `unknown_method`, `invalid_json` | Malformed request, unknown method, bad JSON or a line over `MAX_LINE`. `invalid_params` also covers `delay_ms` above `MAX_DELAY_MS`. |
+| `invalid_params`, `unknown_method`, `invalid_json` | Malformed request, unknown method, bad JSON or a line over `MAX_LINE`. `invalid_params` also covers `delay_ms` above `MAX_DELAY_MS`, a repeated object key, or an array where an object is expected. |
 | `window_not_found`, `ambiguous_window`, `window_gone` | No match (or not a visible top-level window), several matches, or the window vanished mid-operation. |
 | `access_denied` | The window is elevated and the resident is not; `data.elevated: true`. |
 | `excluded_process` | `diagnose` on a process of the fixed exclusion list (`apply` reports it as `applied: false`, `reason: "excluded"`). |
