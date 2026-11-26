@@ -40,7 +40,12 @@ const EX_FRAME: u32 = 0x020E_0381;
 const LEFT: &str = "halves-16-9/left";
 const RIGHT: &str = "halves-16-9/right";
 const NOTEPAD: &[&str] = &["--preset", "notepad"];
-const UNITY_POPUP: &[&str] = &["--preset", "unity-popup"];
+/// Size the Unity-style presets force on themselves. Fits any desktop (frame included, far
+/// below a 1024x768 screen's max track size) and any `halves-16-9/right` island (at least 512
+/// wide on a 1024 px screen), so it is never capped nor clipped, and always differs from it.
+const FORCED: (i32, i32) = (480, 270);
+const UNITY: &[&str] = &["--preset", "unity", "--client", "480x270"];
+const UNITY_POPUP: &[&str] = &["--preset", "unity-popup", "--client", "480x270"];
 
 // -------------------------------------------------------------------- helpers
 
@@ -684,18 +689,18 @@ fn warscape_diagnose_place_restore() {
 #[test]
 #[ignore = "creates real windows; see module docs"]
 fn unity_diagnose_place_restore() {
-    let (_h, mut c, w) = setup("unity_diagnose_place_restore", &["--preset", "unity"]);
+    let (_h, mut c, w) = setup("unity_diagnose_place_restore", UNITY);
     let isl = island_rect(&mut c, "halves-16-9", "right");
     assert_ne!(
         size_of_rect(isl),
-        (1280, 720),
-        "the island must differ from 1280x720"
+        FORCED,
+        "the island must differ from the forced size"
     );
 
     let d = diagnose(&mut c, w.hwnd, RIGHT, 1500, false);
     assert_eq!(d.verdict, Verdict::SizeForced);
     let forced = d.forced_size.expect("forced_size");
-    assert_eq!((forced.width, forced.height), (1280, 720));
+    assert_eq!((forced.width, forced.height), FORCED);
     assert_eq!(d.revert_latency_ms.style, None);
     assert!(d.revert_latency_ms.rect.is_some());
     assert!(
@@ -708,11 +713,11 @@ fn unity_diagnose_place_restore() {
 
     let r = place(&mut c, w.hwnd, RIGHT);
     assert!(r.applied);
-    assert_eq!(size_of_rect(r.r#final), (1280, 720));
+    assert_eq!(size_of_rect(r.r#final), FORCED);
     let size = warning(&r.warnings, "size_forced");
     assert_eq!(
         (size.data["w"].as_i64(), size.data["h"].as_i64()),
-        (Some(1280), Some(720))
+        (Some(FORCED.0 as i64), Some(FORCED.1 as i64))
     );
     assert!(!codes(&r.warnings).contains(&"style_reverted"));
     expect_borderless(snap(w.hwnd), w.orig);
@@ -723,20 +728,28 @@ fn unity_diagnose_place_restore() {
         json!({
             "window": { "hwnd": w.hwnd },
             "island": RIGHT,
-            "game_resolution": { "width": 1280, "height": 720 },
+            "game_resolution": { "width": FORCED.0, "height": FORCED.1 },
         }),
     );
     let (cx, cy) = (
         isl.left + (isl.right - isl.left) / 2,
         isl.top + (isl.bottom - isl.top) / 2,
     );
-    assert_eq!(r.target, rect(cx - 640, cy - 360, cx + 640, cy + 360));
+    assert_eq!(
+        r.target,
+        rect(
+            cx - FORCED.0 / 2,
+            cy - FORCED.1 / 2,
+            cx + FORCED.0 / 2,
+            cy + FORCED.1 / 2
+        )
+    );
     assert!(
         !codes(&r.warnings).contains(&"size_forced"),
         "{:?}",
         r.warnings
     );
-    assert_eq!(size_of_rect(r.r#final), (1280, 720));
+    assert_eq!(size_of_rect(r.r#final), FORCED);
     expect_restored(&mut c, &w);
 }
 
@@ -785,11 +798,11 @@ fn unity_popup_place_diagnose_restore() {
 
     let r = place(&mut c, w.hwnd, RIGHT);
     assert!(r.applied, "{r:?}");
-    assert_eq!(size_of_rect(r.r#final), (1280, 720));
+    assert_eq!(size_of_rect(r.r#final), FORCED);
     let size = warning(&r.warnings, "size_forced");
     assert_eq!(
         (size.data["w"].as_i64(), size.data["h"].as_i64()),
-        (Some(1280), Some(720))
+        (Some(FORCED.0 as i64), Some(FORCED.1 as i64))
     );
     assert!(!codes(&r.warnings).contains(&"style_reverted"));
     assert_eq!(snap(w.hwnd).style, 0x9400_0000);
@@ -799,7 +812,7 @@ fn unity_popup_place_diagnose_restore() {
     let d = diagnose(&mut c, w.hwnd, RIGHT, 1000, false);
     assert_eq!(d.verdict, Verdict::SizeForced);
     let forced = d.forced_size.expect("forced_size");
-    assert_eq!((forced.width, forced.height), (1280, 720));
+    assert_eq!((forced.width, forced.height), FORCED);
     assert_eq!(d.revert_latency_ms.style, None);
     let rect_ms = d.revert_latency_ms.rect.expect("rect latency");
     // docs/GAMES.md: the real popup reverts in < 20 ms, testwin in ~21 ms.
