@@ -995,8 +995,8 @@ mod tests {
     fn query_matches_process_or_title_case_insensitively() {
         let all = vec![
             win(1, "Notepad.exe", "Untitled"),
-            win(2, "game.exe", "NOTES del juego"),
-            win(3, "other.exe", "Otra"),
+            win(2, "game.exe", "NOTES of the game"),
+            win(3, "other.exe", "Other"),
         ];
         let ids = |q| -> Vec<isize> {
             visible_windows(&all, false, q, false)
@@ -1005,7 +1005,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(ids("note"), [1, 2]);
-        assert_eq!(ids("  OTRA "), [3]);
+        assert_eq!(ids("  OTHER "), [3]);
         assert_eq!(ids(""), [1, 2, 3]);
         assert!(ids("zzz").is_empty());
     }
