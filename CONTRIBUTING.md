@@ -13,7 +13,7 @@ installs it on first use. The crate is Rust 2024 edition.
 ```text
 cargo build                                # debug build, console visible
 cargo build --release                      # windows subsystem, LTO, stripped
-cargo test                                 # unit, property and doc tests; never runs the ignored suites
+cargo test                                 # unit (headless GUI included), property and doc tests; never runs the ignored suites
 cargo nextest run                          # optional runner (.config/nextest.toml); use cargo test --doc for doctests
 cargo clippy --all-targets -- -D warnings  # must be clean
 cargo fmt --check
@@ -90,6 +90,9 @@ Checklist:
 - No `unwrap`/`expect` outside tests; every `unsafe` block has a `// SAFETY:` comment.
 - Pure logic (`window_state`, `guard`, `islands`, GUI models) stays free of `windows` types and gets a unit
   test written first; test names read as sentences.
+- GUI views are tested headless on GPUI's test platform (`#[gpui_kit::test]`, see `AGENTS.md`, "Testing & QA"):
+  no OS window opens, and the pipe is never reached. An element a test clicks or finds needs an id and
+  `.test_support()`.
 - Foreign-window calls happen only on the resident thread (see ARCHITECTURE.md, "Event loop").
 
 ## Text and languages

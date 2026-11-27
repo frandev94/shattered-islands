@@ -37,7 +37,7 @@ Short map; module roles, the event loop, the IPC protocol, data files and invari
 ```bash
 cargo build                                # debug: target/debug/borderless-shatter.exe (console visible)
 cargo build --release                      # release: windows subsystem, LTO, stripped
-cargo test                                 # lib unit tests + properties, i18n, cli, mcp tests; ignored suites: see Testing & QA
+cargo test                                 # lib unit tests (headless GUI included) + properties, i18n, cli, mcp tests; ignored suites: see Testing & QA
 cargo clippy --all-targets -- -D warnings  # must be clean
 cargo fmt --check
 borderless-shatter.exe mcp                 # MCP server over stdio
@@ -63,11 +63,12 @@ borderless-shatter.exe list-windows        # CLI; see `borderless-shatter help` 
 
 ## Testing & QA
 
-Tiers, fastest first. Unit, property and pipe tiers need no desktop session; the rest create real windows or resident processes.
+Tiers, fastest first. Unit, GUI (headless), property and pipe tiers need no desktop session; the rest create real windows or resident processes.
 
 | Tier | Command | Desktop | Covers |
 |---|---|---|---|
 | Unit | `cargo test --lib` | no | Pure logic in the crate's `#[cfg(test)]` modules: style and rect math, profile parsing and matching. |
+| GUI (headless) | `cargo test --lib gui::` | no | Panel views on GPUI's test platform (dev-dependency features `test-support` on `gpui-pre`, `gpui-base`, `gpui-component`): no OS window, no OS input, no pixels. Covers the Profiles view rendering and the editor merge (#15: a typed field against an outside change, then each resolve button). A test finds and clicks an element by id only if it calls `.test_support()` (the house `Btn` does; a no-op in normal builds). Under `cfg(test)`, `ipc_call` and `call` fail as "resident unreachable" and never touch the pipe; feed a view its data through its handler (`ProfilesView::apply_load`). |
 | Property | `cargo test --test properties` | no | Invariants over generated inputs (proptest). |
 | Process | `cargo test --test mcp -- --ignored --test-threads=1`, `cargo test --test cli -- --ignored --test-threads=1` | yes | `mcp` and `cli` against an isolated resident. |
 | Pipe | `cargo test --lib ipc::pipe -- --ignored --test-threads=1` | no | The named pipe against a real server. Needs no resident running. |
@@ -92,7 +93,7 @@ Determinism: proptest uses the fixed seed `0xB0_5EED`, no failure persistence an
 
 Manual runs: point both `APPDATA` and `LOCALAPPDATA` at a temp folder and set a short `BORDERLESS_SHATTER_INSTANCE` (an invalid one is refused: exit 1 with `fatal:` for the resident, GUI and MCP, exit 2 for the CLI). `LOCALAPPDATA` holds `state.json`, so isolating only `APPDATA` is not enough.
 
-Known gaps: the GUI and tray UI, multi-monitor layouts, non-primary DPI, elevated windows and real games are not covered. A killed resident can leave a ghost tray icon behind; the harness quits gracefully first to avoid that. `.cargo/mutants.toml` configures cargo-mutants for pure logic only; mutation runs are not part of routine QA.
+Known gaps: the tray UI, the GUI beyond the headless Profiles tests (other views, pixels, real OS input), multi-monitor layouts, non-primary DPI, elevated windows and real games are not covered. A killed resident can leave a ghost tray icon behind; the harness quits gracefully first to avoid that. `.cargo/mutants.toml` configures cargo-mutants for pure logic only; mutation runs are not part of routine QA.
 
 Win32 smoke scripts live outside the repo.
 
