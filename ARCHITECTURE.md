@@ -44,6 +44,7 @@ flowchart LR
 | `islands.rs` | Layouts and islands to physical rects (edges rounded, not sizes); monitor resolution. |
 | `profiles.rs` | Serde model v2 (layouts, islands, `game_resolution`), v1 migration, validation, atomic save, `revision`. |
 | `settings.rs` | `settings.json` (language). |
+| `autostart.rs` | Start at sign-in: the per-user `HKCU\...\Run` value and Task Manager's `StartupApproved` mark. Pure helpers (value name, quoting, blob parsing, classification) plus the registry calls. |
 | `state_store.rs` | `state.json`: what the engine needs to restore windows after an abrupt exit. |
 | `diagnose.rs` | Applies and samples a window to measure whether the game reverts the change. |
 | `watcher.rs` | `SetWinEventHook`; the callback filters and posts. |
@@ -198,5 +199,6 @@ Things the code or its contributors depend on, with the reason in one line each.
 - **`clip_cursor` is accepted and ignored.** Old profiles that carry it keep loading.
 - **Engine, IPC and MCP texts are English only.** Windows localizes OS error text, so messages carry `os error N` or `HRESULT 0x…` instead; clients match `code` and the panel renders its own sentence from `code` and `data`. Only the panel and the tray use the `es` catalog (fallback `es` → `en` → key).
 - **Locale order.** `BORDERLESS_SHATTER_LANG`, then the `language` setting, then the Windows UI language; the tray picks it up at the next resident start.
+- **Start at sign-in lives only in the registry.** The `Run` value `Borderless Shatter` (suffixed with the instance name when `BORDERLESS_SHATTER_INSTANCE` is set) holds the quoted path of the exe; there is no copy in `settings.json` or `profiles.json`. The panel and the tray both read it every time they show it (the tray when its menu opens) and write HKCU directly, since both run as the same user; no IPC method is involved. `StartupApproved\Run` is Task Manager's "Disabled" mark: status reports it, turning the entry on clears it, turning it off removes both. It is a user preference, not window state, so the restore-on-quit rules do not apply. Under `cfg(test)` every registry call fails, so `cargo test` never touches the real keys; the ignored e2e and CLI suites start real residents that only read the `Run` key (under their suffixed name) when they build the tray menu, and never write it.
 - **MCP starts the resident, the CLI never does.** An assistant that calls `apply` without the app running cannot fix that itself, while a script that wants a failure should get exit code 3.
 - **`testwin` stands in for hostile games.** Real games cannot be made to revert a style or force a size on demand, so `examples/testwin.rs` imitates them; its timings differ slightly from the real ones (see `docs/GAMES.md`).
