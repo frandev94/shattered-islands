@@ -100,6 +100,8 @@ Language: the panel has a language selector (System, English, Spanish). The choi
 
 File: `%APPDATA%\BorderlessShatter\profiles.json`. If it does not exist, it is created empty at startup. The format version is `2`; a higher version is rejected and the file is left untouched. A version `1` file is read as is and migrated on the next save; the original is first copied once to `profiles.v1.bak`. Every save also keeps the replaced file as `profiles.json.prev`. An invalid file is reported and never overwritten.
 
+A key repeated in any object, or an array where an object is expected (`offsets`, `game_resolution`, `rect`), makes the file invalid, as for requests. The error names the repeated key (`duplicate key "_note"`) or the JSON path (`/profiles/0/offsets`), and the file is never overwritten. A version higher than `2` is reported as an unsupported version even if the file also repeats a key or uses an array where an object is expected; syntax and type errors are still reported first.
+
 ```json
 {
   "version": 2,

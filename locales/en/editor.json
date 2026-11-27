@@ -20,7 +20,7 @@
   "editor.gate.busy": "Wait for the current operation to finish",
   "editor.gate.errors": "Fix the errors under \"Issues\" to be able to save",
   "editor.gate.clean": "There are no changes to save",
-  "editor.problem.profile_error": "The profiles file cannot be read: it may be damaged or not valid JSON. Fix it by hand; meanwhile the editor is read-only and does not overwrite it.",
+  "editor.problem.profile_error": "The profiles file cannot be read: it is damaged, not valid JSON, repeats a key, or uses an array where an object is expected. Fix it by hand; meanwhile the editor is read-only and does not overwrite it.",
   "editor.problem.unsupported_version": "The profiles file is from a newer version of Borderless Shatter. Update the app to edit it; meanwhile the editor is read-only.",
   "editor.problem.transport": "Cannot connect to Borderless Shatter. Start it with \"Start\" in the sidebar or from the tray icon and try again.",
   "editor.ph.layout_id": "my-layout",
