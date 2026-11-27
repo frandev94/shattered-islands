@@ -7,5 +7,7 @@
   "tray.quit": "Quit",
   "tray.status.no_pipe": "no IPC pipe: {error}",
   "tray.status.pipe_stopped": "IPC pipe stopped: {error}",
-  "tray.status.menu_error": "menu: {error}"
+  "tray.status.menu_error": "menu: {error}",
+  "tray.autostart": "Start at sign-in",
+  "tray.status.autostart_error": "start at sign-in: {error}"
 }

@@ -21,5 +21,9 @@
   "gui.language.spanish": "Español",
   "gui.language.tray_note": "The tray menu changes the next time Borderless Shatter starts.",
   "gui.language.save_refused": "The settings file can't be changed (it is unreadable or from a newer version), so the language will not be remembered.",
-  "gui.language.save_failed": "The language could not be saved, so it will not be remembered."
+  "gui.language.save_failed": "The language could not be saved, so it will not be remembered.",
+  "gui.autostart.label": "Start at sign-in",
+  "gui.autostart.other_path": "Points to another copy: {path}. Turn it on again to use this one.",
+  "gui.autostart.disabled": "Disabled in Task Manager. Turning it on here re-enables it.",
+  "gui.autostart.error": "Could not read or change the start at sign-in setting: {error}"
 }

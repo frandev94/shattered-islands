@@ -21,5 +21,9 @@
   "gui.language.spanish": "Español",
   "gui.language.tray_note": "El menú de la bandeja cambia la próxima vez que se inicie Borderless Shatter.",
   "gui.language.save_refused": "El fichero de ajustes no se puede modificar (no se puede leer o es de una versión más nueva), así que el idioma no se recordará.",
-  "gui.language.save_failed": "No se pudo guardar el idioma, así que no se recordará."
+  "gui.language.save_failed": "No se pudo guardar el idioma, así que no se recordará.",
+  "gui.autostart.label": "Iniciar al abrir sesión",
+  "gui.autostart.other_path": "Apunta a otra copia: {path}. Actívalo de nuevo para usar esta.",
+  "gui.autostart.disabled": "Desactivado en el Administrador de tareas. Al activarlo aquí se vuelve a habilitar.",
+  "gui.autostart.error": "No se pudo leer o cambiar el inicio al abrir sesión: {error}"
 }

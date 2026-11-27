@@ -1,6 +1,7 @@
 //! Borderless Shatter engine: window state, islands, re-assert guard, profiles, IPC and the
 //! resident engine that owns every managed window. `main.rs` only dispatches subcommands.
 
+pub mod autostart;
 pub mod cli;
 pub mod diagnose;
 pub mod engine;

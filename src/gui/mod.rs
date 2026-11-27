@@ -84,6 +84,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Result;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -100,6 +101,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, w};
 
+use crate::autostart::{self, Autostart};
 use crate::i18n::{self, Locale};
 use crate::ipc::pipe::{Client, instance_suffix};
 use crate::ipc::{CallError, ErrorBody, ErrorCode, IpcError};
@@ -474,6 +476,23 @@ impl LangNote {
     }
 }
 
+/// Text under the start-at-sign-in switch: why it reads as it does, or the failure.
+fn autostart_note(state: &Result<Autostart, String>) -> Option<String> {
+    match state {
+        Ok(Autostart::OnOtherPath(path)) => {
+            Some(i18n::tf("gui.autostart.other_path", &[("path", path)]))
+        }
+        Ok(Autostart::DisabledByWindows) => Some(i18n::t("gui.autostart.disabled").into_owned()),
+        Ok(_) => None,
+        Err(e) => Some(i18n::tf("gui.autostart.error", &[("error", e)])),
+    }
+}
+
+/// The registry's answer, phrased for the panel.
+fn read_autostart() -> Result<Autostart, String> {
+    autostart::status().map_err(|e| e.to_string())
+}
+
 /// Store the choice (`None` = follow the system) in the settings file at `path`.
 fn persist_language(path: Option<&Path>, choice: Option<Locale>) -> LangNote {
     let Some(path) = path else {
@@ -503,6 +522,8 @@ struct App {
     /// Language picked in the selector (`None` = system).
     language: Option<Locale>,
     lang_note: Option<LangNote>,
+    /// Start at sign-in, as last read from the registry (the only store).
+    autostart: Result<Autostart, String>,
     windows: Entity<windows_view::WindowsView>,
     islands: Entity<islands_view::IslandsView>,
     editor: Entity<editor_view::EditorView>,
@@ -575,6 +596,7 @@ impl App {
             start_failed: false,
             language: settings::default_path().and_then(|p| settings::load(&p).settings.language),
             lang_note: None,
+            autostart: read_autostart(),
             windows,
             islands,
             editor,
@@ -588,6 +610,12 @@ impl App {
     fn on_probe(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (up, misses) = settle(self.connected, self.misses, up);
         self.misses = misses;
+        // The tray (or Task Manager) may have changed it since the last tick.
+        let autostart = read_autostart();
+        if autostart != self.autostart {
+            self.autostart = autostart;
+            cx.notify();
+        }
         self.set_connected(up, window, cx);
     }
 
@@ -630,6 +658,20 @@ impl App {
         self.editor.update(cx, |_, cx| cx.notify());
         self.profiles.update(cx, |_, cx| cx.notify());
         self.diagnose.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// Switch start at sign-in; the registry is written, then read back for what the switch shows.
+    fn set_autostart(&mut self, on: bool, cx: &mut Context<Self>) {
+        let done = if on {
+            autostart::enable()
+        } else {
+            autostart::disable()
+        };
+        self.autostart = match done {
+            Ok(()) => read_autostart(),
+            Err(e) => Err(e.to_string()),
+        };
         cx.notify();
     }
 
@@ -759,6 +801,27 @@ impl App {
                     .child(n.text().into_owned())
             }))
     }
+
+    /// "Start at sign-in" switch with the note that explains an odd state.
+    fn autostart_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = matches!(self.autostart, Ok(Autostart::On));
+        div()
+            .flex()
+            .flex_col()
+            .gap(SP_2)
+            .px(SP_3)
+            .pb(SP_3)
+            .child(
+                Switch::new("autostart")
+                    .label(i18n::t("gui.autostart.label").into_owned())
+                    .checked(on)
+                    .on_click(cx.listener(|t, v: &bool, _, cx| t.set_autostart(*v, cx))),
+            )
+            .children(
+                autostart_note(&self.autostart)
+                    .map(|n| div().text_size(TEXT_SM).text_color(text_muted()).child(n)),
+            )
+    }
 }
 
 impl Render for App {
@@ -804,6 +867,7 @@ impl Render for App {
             .child(nav)
             .child(div().flex_1())
             .child(self.language_panel(cx))
+            .child(self.autostart_panel(cx))
             .child(self.connection_panel(cx));
 
         let view = match self.section {
@@ -1024,6 +1088,32 @@ mod tests {
                 assert!(n.text().contains(' '), "{l:?} {n:?}: {}", n.text());
             }
         }
+    }
+
+    #[test]
+    fn autostart_note_explains_other_path_and_windows_disabled() {
+        let en = |s| {
+            let _g = i18n::scoped_locale(Locale::En);
+            autostart_note(&s)
+        };
+        assert_eq!(en(Ok(Autostart::Off)), None);
+        assert_eq!(en(Ok(Autostart::On)), None);
+        assert_eq!(
+            en(Ok(Autostart::OnOtherPath(r"D:\old\bs.exe".into()))).as_deref(),
+            Some(r"Points to another copy: D:\old\bs.exe. Turn it on again to use this one.")
+        );
+        assert_eq!(
+            en(Ok(Autostart::DisabledByWindows)).as_deref(),
+            Some("Disabled in Task Manager. Turning it on here re-enables it.")
+        );
+        assert!(en(Err("boom".into())).is_some_and(|t| t.contains("boom")));
+    }
+
+    #[test]
+    fn autostart_notes_have_spanish_text() {
+        let _g = i18n::scoped_locale(Locale::Es);
+        let note = autostart_note(&Ok(Autostart::DisabledByWindows)).unwrap();
+        assert!(note.starts_with("Desactivado"), "{note}");
     }
 
     #[test]
