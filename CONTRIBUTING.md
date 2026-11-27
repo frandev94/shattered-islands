@@ -49,6 +49,10 @@ gh workflow run e2e.yml --ref <branch>
 On-demand runs need the workflow file on `main`. If `gh` refuses the branch, use the run of the pull request
 or run the workflow on `main` after the merge.
 
+A run takes about 7 minutes on a warm cache; the release `mcp` case builds without LTO and with 16 codegen
+units (`CARGO_PROFILE_RELEASE_*` env on that step only). The first run of a branch builds cold and saves the
+cache; later pushes reuse it.
+
 The run summary (`$GITHUB_STEP_SUMMARY`, shown on the run page) has three tables: the probe result, passed and
 failed per suite and run, and the hygiene checks after each suite. The full logs are in the `e2e-logs`
 artifact, kept for 14 days.
