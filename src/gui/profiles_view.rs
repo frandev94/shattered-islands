@@ -674,6 +674,25 @@ enum Op {
     Remove(String),
 }
 
+/// A notice kept as its i18n key and process name, so it is translated when shown.
+struct Notice {
+    key: &'static str,
+    process: String,
+}
+
+impl Notice {
+    fn new(key: &'static str, process: &str) -> Self {
+        Self {
+            key,
+            process: process.to_owned(),
+        }
+    }
+
+    fn text(&self) -> String {
+        i18n::tf(self.key, &[("process", &self.process)])
+    }
+}
+
 // ===================================================================== the view
 
 struct Editor {
@@ -723,7 +742,7 @@ pub struct ProfilesView {
     loading: bool,
     saving: bool,
     editor: Option<Editor>,
-    notice: Option<String>,
+    notice: Option<Notice>,
     save_error: Option<String>,
     /// Warnings of the last `set_profiles` answer (replace the file's while visible).
     save_warnings: Vec<Warning>,
@@ -732,7 +751,7 @@ pub struct ProfilesView {
     /// (it needs the window).
     refill: Option<Merged>,
     /// Why the open form no longer matches what it was opened with (shown while editing).
-    outside: Option<String>,
+    outside: Option<Notice>,
     confirm_delete: Option<String>,
     last_render: Instant,
     /// Language the editor placeholders were last set for.
@@ -886,9 +905,10 @@ impl ProfilesView {
                                 if let Some(e) = &mut t.editor {
                                     e.base = None;
                                     e.conflicts.clear();
-                                    t.outside = e.original.take().map(|o| {
-                                        i18n::tf("profiles.outside.removed", &[("process", &o)])
-                                    });
+                                    t.outside = e
+                                        .original
+                                        .take()
+                                        .map(|o| Notice::new("profiles.outside.removed", &o));
                                 }
                             }
                         }
@@ -972,8 +992,8 @@ impl ProfilesView {
         self.notice = None;
         cx.notify();
         let done = match &op {
-            Op::Upsert(p) => i18n::tf("profiles.saved", &[("process", &p.process)]),
-            Op::Remove(n) => i18n::tf("profiles.removed", &[("process", n)]),
+            Op::Upsert(p) => Notice::new("profiles.saved", &p.process),
+            Op::Remove(n) => Notice::new("profiles.removed", n),
         };
         cx.spawn(async move |this, cx| {
             let r = ipc_call(cx, move |c| {
@@ -1163,10 +1183,7 @@ impl Render for ProfilesView {
                 if let Some(e) = &mut self.editor {
                     e.conflicts = m.conflicts;
                 }
-                self.outside = Some(i18n::tf(
-                    "profiles.outside.merged",
-                    &[("process", &process)],
-                ));
+                self.outside = Some(Notice::new("profiles.outside.merged", &process));
             }
         }
         self.last_render = Instant::now();
@@ -1226,10 +1243,10 @@ impl Render for ProfilesView {
             body = body.child(banner(e.clone(), BadgeKind::Error));
         }
         if let Some(n) = &self.notice {
-            body = body.child(banner(n.clone(), BadgeKind::Ok));
+            body = body.child(banner(n.text(), BadgeKind::Ok));
         }
         if let Some(n) = self.outside.as_ref().filter(|_| self.editor.is_some()) {
-            body = body.child(banner(n.clone(), BadgeKind::Warn));
+            body = body.child(banner(n.text(), BadgeKind::Warn));
         }
         if self
             .editor
@@ -1877,6 +1894,21 @@ mod tests {
             outside_change(None, &same, &changed_other),
             OutsideChange::None
         );
+    }
+
+    #[test]
+    fn outside_notice_is_translated_when_shown() {
+        let notice = Notice::new("profiles.outside.merged", "game.exe");
+        let en = {
+            let _g = i18n::scoped_locale(Locale::En);
+            notice.text()
+        };
+        let es = {
+            let _g = i18n::scoped_locale(Locale::Es);
+            notice.text()
+        };
+        assert!(en.starts_with("game.exe was changed outside"), "{en}");
+        assert_ne!(en, es);
     }
 
     #[test]
