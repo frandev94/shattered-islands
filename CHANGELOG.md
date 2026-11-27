@@ -2,6 +2,28 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.6] - 2026-11-27
+
+### 🚀 Features
+
+- *(gui)* Keep typed profile values when the profile changes outside
+
+### 🐛 Bug Fixes
+
+- *(gui)* Mark coupled profile fields and merge on every reload safely
+- *(gui)* Translate the profiles notices when they are shown
+
+### 📚 Documentation
+
+- Note the e2e duration and the fast release profile
+- Describe the profiles editor merge
+- Note coupled fields in the profiles merge
+
+### ⚙️ Miscellaneous Tasks
+
+- *(e2e)* Build the release case without LTO and keep the cache after failures
+- *(e2e)* Build the release examples as plain binaries
+
 ## [0.2.5] - 2026-11-27
 
 ### 🐛 Bug Fixes
