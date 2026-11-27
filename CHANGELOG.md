@@ -2,6 +2,29 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] - 2026-11-27
+
+### 🐛 Bug Fixes
+
+- *(cli)* Reject duplicate keys in the profiles set body
+
+### 📚 Documentation
+
+- Add the clean-up rule for extra checkouts to AGENTS.md
+- *(win32)* Point the unsafe-sites note at AGENTS.md
+- Note that the CLI rejects duplicate keys in the profiles set body
+
+### 🧪 Testing
+
+- *(e2e)* Re-adopt state.json entries with legacy and unresolvable island refs
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Publish the sha256 in text format and leave a blank line between changelog sections
+- *(test)* Run the test workflow on pull requests, on demand and from release only
+- *(deny)* Drop licence allowances no dependency uses
+- *(release)* Describe a missing release tag accurately in the gate error
+
 ## [0.2.3] - 2026-11-26
 
 ### 🐛 Bug Fixes
