@@ -184,10 +184,11 @@ jobs:
                       suite(name, run, cmd)
                       check_hygiene(f"{name} run {run}")
 
-              # One compile serves both: `--no-run` builds the mcp test and the examples it launches, the
-              # second command only runs. Same env on both or cargo would rebuild. LTO off and 16 codegen
-              # units only speed up the build; debug_assertions stays off and the exes stay GUI-subsystem.
-              built, _ = suite("release-build", 1, ["cargo", "test", "--release", "--test", "mcp", "--examples", "--no-run"],
+              # `cargo test --examples` builds examples as hashed test targets; the harness needs the plain
+              # target/release/examples/testwin.exe, so build the examples normally, then compile the mcp
+              # test (same env, `release` profile: lib and examples are fresh, only bin + test link).
+              # LTO off and 16 codegen units only speed up the build; debug_assertions stays off.
+              built, _ = suite("release-build", 1, ["cargo", "build", "--release", "--examples"],
                                env=RELEASE_ENV, tests=False)
               if built:
                   suite("release-mcp", 1, ["cargo", "test", "--release", "--test", "mcp", "--", "--ignored", "--test-threads=1"],
