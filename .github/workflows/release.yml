@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           last=$(git describe --tags --abbrev=0) || {
-            echo "::error::No tag reachable from this commit: tag the last 0.1 commit v0.1.0 first (CONTRIBUTING.md#releases)."
+            echo "::error::No release tag is reachable from this commit. Check that the tags were fetched and pushed (the checkout uses fetch-depth: 0)."
             exit 1
           }
           echo "last=$last" >> "$GITHUB_OUTPUT"
