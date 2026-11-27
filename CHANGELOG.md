@@ -2,6 +2,16 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.5] - 2026-11-27
+
+### 🐛 Bug Fixes
+
+- *(profiles)* Reject duplicate keys and arrays where objects are expected in profiles.json
+
+### 📚 Documentation
+
+- Describe strict loading of profiles.json
+
 ## [0.2.4] - 2026-11-27
 
 ### 🐛 Bug Fixes
