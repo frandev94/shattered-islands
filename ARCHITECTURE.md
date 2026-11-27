@@ -173,7 +173,7 @@ write `<file>.tmp`, `sync_all`, then rename, so a reader or a power cut sees the
   desktop.
 - Every `unsafe` block has a `// SAFETY:` comment; no `unwrap`/`expect` outside tests.
 - The pipe is per user with a protected DACL; the protocol and MCP tool texts are English only.
-- The editor saves with the `revision` it read, so a concurrent change is a `revision_conflict`, never a silent overwrite.
+- The editor saves with the `revision` it read, so a concurrent change is a `revision_conflict`, never a silent overwrite. After a `revision_conflict` the profile form reloads and merges field by field (base = the saved profile it was opened on, mine = the typed form, theirs = the reloaded profile): one-sided changes are taken automatically, a field changed on both sides to different values is marked and keeps the typed value until the user picks one, and the form saves with the new revision only when no field is marked. Cancel discards the merge.
 
 ## Design constraints
 
