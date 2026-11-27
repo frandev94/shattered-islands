@@ -2,6 +2,21 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.7] - 2026-11-27
+
+### 🚀 Features
+
+- *(app)* Start at sign-in from the tray and the panel
+
+### 📚 Documentation
+
+- Describe the headless GUI tests
+- Describe start at sign-in
+
+### 🧪 Testing
+
+- *(gui)* Run the profiles view headless in cargo test
+
 ## [0.2.6] - 2026-11-27
 
 ### 🚀 Features
