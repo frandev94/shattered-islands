@@ -318,7 +318,16 @@ fn read_profiles_body(path: &str, read_body: ReadBody) -> Result<Map<String, Val
     }
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
     match serde_json::from_slice(bytes) {
-        Ok(Value::Object(m)) => Ok(m),
+        Ok(Value::Object(m)) => {
+            // `Value` keeps the last of repeated keys; the resident rejects them, so do it here too.
+            ipc::check_unique_keys(bytes).map_err(|e| {
+                tf(
+                    "cli.error.body_duplicate_key",
+                    &[("file", &shown), ("reason", &e)],
+                )
+            })?;
+            Ok(m)
+        }
         Ok(_) => Err(tf("cli.error.body_not_object", &[("file", &shown)])),
         Err(e) => Err(tf(
             "cli.error.body_invalid_json",
@@ -738,6 +747,20 @@ mod tests {
             let e = p_body(&["profiles", "set", "-"], &units(le)).unwrap_err();
             assert!(e.contains("UTF-16"), "{e}");
         }
+    }
+
+    #[test]
+    fn profiles_set_rejects_duplicate_keys() {
+        let _g = scoped_locale(Locale::En);
+        for body in [
+            &br#"{"profiles":[],"profiles":[]}"#[..],
+            br#"{"profiles":[{"process":"a.exe","process":"b.exe"}]}"#,
+            br#"{"remove":["a"],"\u0072emove":["b"]}"#,
+        ] {
+            let e = p_body(&["profiles", "set", "-"], body).unwrap_err();
+            assert!(e.contains("more than once"), "{e}");
+        }
+        assert!(p_body(&["profiles", "set", "-"], br#"{"remove":["a"]}"#).is_ok());
     }
 
     #[test]
