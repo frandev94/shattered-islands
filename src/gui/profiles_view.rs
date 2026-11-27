@@ -46,6 +46,9 @@ pub enum Field {
     Delay,
     Width,
     Height,
+    Enabled,
+    Island,
+    Monitor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,6 +418,126 @@ pub fn outside_change(original: Option<&str>, old: &[Profile], new: &[Profile]) 
     }
 }
 
+/// Result of [`merge_form`]: the form to show and the fields changed on both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+    pub form: FormInput,
+    pub conflicts: Vec<Field>,
+}
+
+/// Every field a merge compares, in form order.
+const MERGE_FIELDS: [Field; 11] = [
+    Field::Process,
+    Field::Enabled,
+    Field::Island,
+    Field::Monitor,
+    Field::Left,
+    Field::Top,
+    Field::Right,
+    Field::Bottom,
+    Field::Delay,
+    Field::Width,
+    Field::Height,
+];
+
+/// The text of a text field (`None` for `enabled`, `island` and `monitor`).
+fn text_of(f: &FormInput, field: Field) -> Option<&str> {
+    Some(match field {
+        Field::Process => &f.process,
+        Field::Left => &f.offsets[0],
+        Field::Top => &f.offsets[1],
+        Field::Right => &f.offsets[2],
+        Field::Bottom => &f.offsets[3],
+        Field::Delay => &f.delay,
+        Field::Width => &f.width,
+        Field::Height => &f.height,
+        Field::Enabled | Field::Island | Field::Monitor => return None,
+    })
+}
+
+/// Whether `field` holds the same value in both forms (text compared with `trim()`).
+fn same_field(a: &FormInput, b: &FormInput, field: Field) -> bool {
+    match field {
+        Field::Enabled => a.enabled == b.enabled,
+        Field::Island => a.island.as_deref().map(str::trim) == b.island.as_deref().map(str::trim),
+        Field::Monitor => a.monitor == b.monitor,
+        _ => text_of(a, field).map(str::trim) == text_of(b, field).map(str::trim),
+    }
+}
+
+/// Copies `field` from `src` into `dst`.
+fn copy_field(dst: &mut FormInput, src: &FormInput, field: Field) {
+    match field {
+        Field::Enabled => dst.enabled = src.enabled,
+        Field::Island => dst.island.clone_from(&src.island),
+        Field::Monitor => dst.monitor = src.monitor,
+        Field::Process => dst.process.clone_from(&src.process),
+        Field::Left => dst.offsets[0].clone_from(&src.offsets[0]),
+        Field::Top => dst.offsets[1].clone_from(&src.offsets[1]),
+        Field::Right => dst.offsets[2].clone_from(&src.offsets[2]),
+        Field::Bottom => dst.offsets[3].clone_from(&src.offsets[3]),
+        Field::Delay => dst.delay.clone_from(&src.delay),
+        Field::Width => dst.width.clone_from(&src.width),
+        Field::Height => dst.height.clone_from(&src.height),
+    }
+}
+
+/// Three-way merge per field of the typed form (`mine`) with the reloaded profile (`theirs`)
+/// over the saved version it was opened on (`base`). A field changed on both sides to different
+/// values is a conflict and keeps `mine`; `pending` conflicts from an earlier merge stay
+/// conflicts unless both sides now agree.
+pub fn merge_form(
+    base: &FormInput,
+    mine: &FormInput,
+    theirs: &FormInput,
+    pending: &[Field],
+) -> Merged {
+    let mut form = mine.clone();
+    let mut conflicts = Vec::new();
+    for field in MERGE_FIELDS {
+        if same_field(mine, theirs, field) {
+            continue;
+        }
+        if pending.contains(&field) {
+            conflicts.push(field);
+        } else if same_field(mine, base, field) {
+            copy_field(&mut form, theirs, field);
+        } else if !same_field(theirs, base, field) {
+            conflicts.push(field);
+        }
+    }
+    Merged { form, conflicts }
+}
+
+/// `form` with the given `fields` replaced by the ones in `theirs`.
+pub fn take_fields(form: &FormInput, theirs: &FormInput, fields: &[Field]) -> FormInput {
+    let mut out = form.clone();
+    for &field in fields {
+        copy_field(&mut out, theirs, field);
+    }
+    out
+}
+
+/// The outside value of `field`, readable in the active language.
+pub fn outside_value(theirs: &FormInput, field: Field) -> String {
+    match field {
+        Field::Enabled if theirs.enabled => i18n::t("profiles.editor.enabled_yes").into_owned(),
+        Field::Enabled => i18n::t("profiles.editor.enabled_no").into_owned(),
+        Field::Island => match theirs.island.as_deref().map(str::trim) {
+            Some(i) if !i.is_empty() => i.to_owned(),
+            _ => i18n::t("profiles.editor.no_island").into_owned(),
+        },
+        Field::Monitor => match theirs.monitor {
+            MonitorChoice::Current => i18n::t("profiles.editor.monitor_current").into_owned(),
+            MonitorChoice::Index(n) => i18n::tf("profiles.summary.monitor", &[("n", &n)]),
+        },
+        _ => match text_of(theirs, field).map(str::trim) {
+            Some(t) if !t.is_empty() => t.to_owned(),
+            _ => i18n::t("profiles.outside.empty").into_owned(),
+        },
+    }
+}
+
 // ======================================================================== IPC glue
 
 struct Data {
@@ -489,7 +612,31 @@ struct Editor {
     enabled: bool,
     island: Option<String>,
     monitor: MonitorChoice,
+    /// The saved version the form is based on (None = new profile): the merge base.
+    base: Option<FormInput>,
+    /// Fields changed here and outside to different values; `base` holds the outside ones.
+    conflicts: Vec<Field>,
     _subs: Vec<Subscription>,
+}
+
+impl Editor {
+    /// The text input of `field` (`None` for the chip fields).
+    fn input(&self, field: Field) -> Option<Entity<InputState>> {
+        Some(
+            match field {
+                Field::Process => &self.process,
+                Field::Left => &self.offsets[0],
+                Field::Top => &self.offsets[1],
+                Field::Right => &self.offsets[2],
+                Field::Bottom => &self.offsets[3],
+                Field::Delay => &self.delay,
+                Field::Width => &self.width,
+                Field::Height => &self.height,
+                Field::Enabled | Field::Island | Field::Monitor => return None,
+            }
+            .clone(),
+        )
+    }
 }
 
 pub struct ProfilesView {
@@ -506,9 +653,9 @@ pub struct ProfilesView {
     /// Warnings of the last `set_profiles` answer (replace the file's while visible).
     save_warnings: Vec<Warning>,
     conflict: bool,
-    /// The edited profile changed outside: refill the form from it at the next render (it
-    /// needs the window).
-    refill: Option<Profile>,
+    /// The edited profile changed outside: reopen the form with this merge at the next render
+    /// (it needs the window).
+    refill: Option<Merged>,
     /// Why the open form no longer matches what it was opened with (shown while editing).
     outside: Option<String>,
     confirm_delete: Option<String>,
@@ -646,12 +793,27 @@ impl ProfilesView {
                         t.error = None;
                         t.read_only = false;
                         // Never keep stale form values silently over an outside change.
-                        if let (Some(e), Some(old)) = (&mut t.editor, &t.data) {
-                            match outside_change(e.original.as_deref(), &old.profiles, &d.profiles)
-                            {
-                                OutsideChange::None => {}
-                                OutsideChange::Changed(p) => t.refill = Some(p),
-                                OutsideChange::Removed => {
+                        let change = match (&t.editor, &t.data) {
+                            (Some(e), Some(old)) => {
+                                outside_change(e.original.as_deref(), &old.profiles, &d.profiles)
+                            }
+                            _ => OutsideChange::None,
+                        };
+                        match change {
+                            OutsideChange::None => {}
+                            OutsideChange::Changed(p) => {
+                                if let (Some(e), Some(mine)) = (&t.editor, t.form(cx)) {
+                                    // No base cannot happen for an edit; merging over `mine`
+                                    // then takes every outside value, never overwrites one.
+                                    let base = e.base.as_ref().unwrap_or(&mine);
+                                    let theirs = FormInput::from_profile(&p);
+                                    t.refill = Some(merge_form(base, &mine, &theirs, &e.conflicts));
+                                }
+                            }
+                            OutsideChange::Removed => {
+                                if let Some(e) = &mut t.editor {
+                                    e.base = None;
+                                    e.conflicts.clear();
                                     t.outside = e.original.take().map(|o| {
                                         i18n::tf("profiles.outside.removed", &[("process", &o)])
                                     });
@@ -689,6 +851,11 @@ impl ProfilesView {
         let width = new_input(window, cx, &width_ph, &f.width, &mut subs);
         let height_ph = i18n::t("profiles.editor.height_placeholder");
         let height = new_input(window, cx, &height_ph, &f.height, &mut subs);
+        let base = original.as_deref().and_then(|o| {
+            let d = self.data.as_ref()?;
+            let p = d.profiles.iter().find(|p| same_process(&p.process, o))?;
+            Some(FormInput::from_profile(p))
+        });
         self.editor = Some(Editor {
             original,
             process,
@@ -699,6 +866,8 @@ impl ProfilesView {
             enabled: f.enabled,
             island: f.island.clone(),
             monitor: f.monitor,
+            base,
+            conflicts: Vec::new(),
             _subs: subs,
         });
         self.notice = None;
@@ -778,12 +947,35 @@ impl ProfilesView {
     }
 
     fn save_editor(&mut self, cx: &mut Context<Self>) {
-        let (Some(form), Some(d)) = (self.form(cx), self.data.as_ref()) else {
+        let (Some(form), Some(d), Some(e)) = (self.form(cx), self.data.as_ref(), &self.editor)
+        else {
             return;
         };
-        let original = self.editor.as_ref().and_then(|e| e.original.clone());
-        if let Ok(p) = build_profile(&form, &d.profiles, original.as_deref()) {
+        // Pending conflicts are resolved only by the banner buttons, never by a plain save.
+        if !e.conflicts.is_empty() {
+            return;
+        }
+        if let Ok(p) = build_profile(&form, &d.profiles, e.original.as_deref()) {
             self.submit(Op::Upsert(p), cx);
+        }
+    }
+
+    /// "Use the outside values": the conflicting fields take the outside version; nothing is
+    /// saved yet.
+    fn use_outside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(e), Some(form)) = (&self.editor, self.form(cx)) else {
+            return;
+        };
+        let Some(base) = &e.base else { return };
+        let next = take_fields(&form, base, &e.conflicts);
+        let fields = e.conflicts.clone();
+        let original = e.original.clone();
+        let outside = self.outside.take();
+        self.open_editor(&next, original, window, cx);
+        self.outside = outside;
+        // The clicked button is gone: keep keyboard focus in the form, on the first taken field.
+        if let Some(input) = fields.iter().find_map(|&f| self.editor.as_ref()?.input(f)) {
+            input.update(cx, |s, cx| s.focus(window, cx));
         }
     }
 
@@ -853,6 +1045,18 @@ fn labeled(label: &str, child: impl IntoElement, error: Option<&str>) -> Div {
         })
 }
 
+/// Under a field changed here and outside: its outside value, in the field error's slot.
+fn with_outside(field: Div, theirs: Option<String>) -> Div {
+    field.when_some(theirs, |d, v| {
+        d.child(
+            div()
+                .text_size(TEXT_SM)
+                .text_color(warn())
+                .child(i18n::tf("profiles.outside.theirs", &[("value", &v)])),
+        )
+    })
+}
+
 fn banner(msg: impl Into<SharedString>, kind: BadgeKind) -> Div {
     let (tag, color) = match kind {
         BadgeKind::Error => (i18n::t("profiles.banner.error"), danger()),
@@ -875,13 +1079,18 @@ fn banner(msg: impl Into<SharedString>, kind: BadgeKind) -> Div {
 impl Render for ProfilesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_locale(window, cx);
-        if let Some(p) = self.refill.take().filter(|_| self.editor.is_some()) {
-            let form = FormInput::from_profile(&p);
-            self.open_editor(&form, Some(p.process.clone()), window, cx);
-            self.outside = Some(i18n::tf(
-                "profiles.outside.changed",
-                &[("process", &p.process)],
-            ));
+        if let Some(m) = self.refill.take() {
+            let original = self.editor.as_ref().and_then(|e| e.original.clone());
+            if let Some(process) = original.clone() {
+                self.open_editor(&m.form, original, window, cx);
+                if let Some(e) = &mut self.editor {
+                    e.conflicts = m.conflicts;
+                }
+                self.outside = Some(i18n::tf(
+                    "profiles.outside.merged",
+                    &[("process", &process)],
+                ));
+            }
         }
         self.last_render = Instant::now();
         let busy = self.saving;
@@ -944,6 +1153,13 @@ impl Render for ProfilesView {
         }
         if let Some(n) = self.outside.as_ref().filter(|_| self.editor.is_some()) {
             body = body.child(banner(n.clone(), BadgeKind::Warn));
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| !e.conflicts.is_empty())
+        {
+            body = body.child(self.merge_card(cx));
         }
         if let Some(e) = &self.save_error {
             body = body.child(banner(e.clone(), BadgeKind::Error));
@@ -1058,6 +1274,52 @@ impl ProfilesView {
                             }),
                         ))
                     }),
+            )
+    }
+
+    /// Fields changed here and outside: say so and offer the two ways out.
+    fn merge_card(&self, cx: &mut Context<Self>) -> Div {
+        let valid = match (&self.editor, &self.data, self.form(cx)) {
+            (Some(e), Some(d), Some(f)) => {
+                build_profile(&f, &d.profiles, e.original.as_deref()).is_ok()
+            }
+            _ => false,
+        };
+        let idle = !self.saving && !self.loading && !self.read_only;
+        card()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(warn())
+                    .child(i18n::t("profiles.outside.conflicts").into_owned()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(SP_2)
+                    .child(
+                        primary_button(
+                            "merge-keep-mine",
+                            i18n::t("profiles.outside.keep_mine").into_owned(),
+                            cx.listener(|t, _, _, cx| {
+                                if let Some(e) = &mut t.editor {
+                                    e.conflicts.clear();
+                                }
+                                t.save_editor(cx);
+                            }),
+                        )
+                        // Disabled while invalid: clearing the marks without saving would lie.
+                        .disabled(!(valid && idle)),
+                    )
+                    .child(
+                        secondary_button(
+                            "merge-use-theirs",
+                            i18n::t("profiles.outside.use_theirs").into_owned(),
+                            cx.listener(|t, _, w, cx| t.use_outside(w, cx)),
+                        )
+                        .disabled(!idle),
+                    ),
             )
     }
 
@@ -1195,6 +1457,12 @@ impl ProfilesView {
                 .find(|x| x.field == f)
                 .map(|x| x.message.clone())
         };
+        let theirs_of = |f: Field| {
+            e.base
+                .as_ref()
+                .filter(|_| e.conflicts.contains(&f))
+                .map(|b| outside_value(b, f))
+        };
         let has_island = e.island.is_some();
         let title = if e.original.is_some() {
             i18n::t("profiles.editor.title_edit")
@@ -1302,6 +1570,7 @@ impl ProfilesView {
                     .child(hint),
             )
         });
+        let island_row = with_outside(island_row, theirs_of(Field::Island));
 
         let mut monitors: Vec<(MonitorChoice, String)> = vec![(
             MonitorChoice::Current,
@@ -1342,11 +1611,15 @@ impl ProfilesView {
                 })),
             None,
         );
+        let monitor_row = with_outside(monitor_row, theirs_of(Field::Monitor));
 
         let num = |label: &str, st: &Entity<InputState>, f: Field, off: bool| {
-            labeled(label, Input::new(st).disabled(off), err_of(f).as_deref())
-                .w(px(130.))
-                .when(off, |d| d.opacity(0.5))
+            with_outside(
+                labeled(label, Input::new(st).disabled(off), err_of(f).as_deref()),
+                theirs_of(f),
+            )
+            .w(px(130.))
+            .when(off, |d| d.opacity(0.5))
         };
         let offs = div().flex().flex_wrap().gap(SP_3).children(
             [
@@ -1359,7 +1632,7 @@ impl ProfilesView {
             .enumerate()
             .map(|(i, (l, f))| num(&l, &e.offsets[i], f, has_island)),
         );
-        let can_save = result.is_ok() && !self.saving && !self.read_only;
+        let can_save = result.is_ok() && e.conflicts.is_empty() && !self.saving && !self.read_only;
         let enabled_now = e.enabled;
 
         card()
@@ -1411,21 +1684,24 @@ impl ProfilesView {
                     .text_color(text_muted())
                     .child(i18n::t("profiles.editor.resolution_help").into_owned()),
             )
-            .child(chip(
-                "enabled",
-                if enabled_now {
-                    i18n::t("profiles.editor.enabled_yes").into_owned()
-                } else {
-                    i18n::t("profiles.editor.enabled_no").into_owned()
-                },
-                enabled_now,
-                false,
-                cx.listener(|t, _, _, cx| {
-                    if let Some(e) = &mut t.editor {
-                        e.enabled = !e.enabled;
-                    }
-                    cx.notify();
-                }),
+            .child(with_outside(
+                div().flex().flex_col().gap(SP_1).child(chip(
+                    "enabled",
+                    if enabled_now {
+                        i18n::t("profiles.editor.enabled_yes").into_owned()
+                    } else {
+                        i18n::t("profiles.editor.enabled_no").into_owned()
+                    },
+                    enabled_now,
+                    false,
+                    cx.listener(|t, _, _, cx| {
+                        if let Some(e) = &mut t.editor {
+                            e.enabled = !e.enabled;
+                        }
+                        cx.notify();
+                    }),
+                )),
+                theirs_of(Field::Enabled),
             ))
             .child(
                 div()
@@ -1855,5 +2131,315 @@ mod tests {
             remote_message(&plain),
             i18n::error_sentence(ErrorCode::ProfileError)
         );
+    }
+
+    // ------------------------------------------------------- three-way merge
+
+    fn with(f: impl FnOnce(&mut FormInput)) -> FormInput {
+        let mut x = form("g.exe");
+        f(&mut x);
+        x
+    }
+
+    #[test]
+    fn merge_takes_outside_only_changes() {
+        let base = form("g.exe");
+        let theirs = with(|f| {
+            f.offsets[1] = "7".into();
+            f.enabled = false;
+            f.island = Some("l/i".into());
+            f.monitor = MonitorChoice::Index(1);
+            f.width = "1280".into();
+        });
+        let got = merge_form(&base, &base, &theirs, &[]);
+        assert_eq!(
+            got,
+            Merged {
+                form: theirs,
+                conflicts: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn merge_keeps_local_only_changes() {
+        let base = form("g.exe");
+        let mine = with(|f| {
+            f.offsets[0] = "5".into();
+            f.delay = "200".into();
+            f.enabled = false;
+        });
+        let theirs = with(|f| f.offsets[1] = "7".into());
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        let want = with(|f| {
+            f.offsets = ["5".into(), "7".into(), "0".into(), "0".into()];
+            f.delay = "200".into();
+            f.enabled = false;
+        });
+        assert_eq!(
+            got,
+            Merged {
+                form: want,
+                conflicts: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn merge_flags_fields_changed_on_both_sides() {
+        let base = form("g.exe");
+        let mine = with(|f| {
+            f.island = Some("a/x".into());
+            f.monitor = MonitorChoice::Index(1);
+            f.offsets = ["1".into(), "2".into(), "3".into(), "4".into()];
+            f.delay = "10".into();
+            f.width = "100".into();
+            f.height = "200".into();
+        });
+        let theirs = with(|f| {
+            f.island = Some("b/y".into());
+            f.monitor = MonitorChoice::Index(2);
+            f.offsets = ["9".into(), "8".into(), "7".into(), "6".into()];
+            f.delay = "20".into();
+            f.width = "300".into();
+            f.height = "400".into();
+        });
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        assert_eq!(got.form, mine);
+        assert_eq!(
+            got.conflicts,
+            [
+                Field::Island,
+                Field::Monitor,
+                Field::Left,
+                Field::Top,
+                Field::Right,
+                Field::Bottom,
+                Field::Delay,
+                Field::Width,
+                Field::Height,
+            ]
+        );
+        // A bool cannot clash three ways; `enabled` conflicts only as a pending one.
+        let off = with(|f| f.enabled = false);
+        let got = merge_form(&base, &off, &base, &[Field::Enabled]);
+        assert_eq!(
+            got,
+            Merged {
+                form: off,
+                conflicts: vec![Field::Enabled]
+            }
+        );
+    }
+
+    /// The form with every text field trimmed: the merge may keep either padding of equal values.
+    fn trimmed(f: &FormInput) -> FormInput {
+        FormInput {
+            island: f.island.as_deref().map(|s| s.trim().to_owned()),
+            offsets: f.offsets.clone().map(|s| s.trim().to_owned()),
+            delay: f.delay.trim().into(),
+            width: f.width.trim().into(),
+            height: f.height.trim().into(),
+            ..f.clone()
+        }
+    }
+
+    #[test]
+    fn merge_same_value_on_both_sides_is_no_conflict() {
+        let base = form("g.exe");
+        let both = with(|f| {
+            f.delay = " 50 ".into();
+            f.island = Some("l/i".into());
+        });
+        let theirs = with(|f| {
+            f.delay = "50".into();
+            f.island = Some("l/i".into());
+        });
+        let got = merge_form(&base, &both, &theirs, &[]);
+        assert!(got.conflicts.is_empty());
+        assert_eq!(got.form.delay.trim(), "50");
+        assert_eq!(got.form.island.as_deref(), Some("l/i"));
+    }
+
+    #[test]
+    fn merge_keeps_pending_conflicts_across_reloads() {
+        // First reload: delay conflicted (mine 200, outside 300); base became theirs.
+        let base = with(|f| f.delay = "300".into());
+        let mine = with(|f| f.delay = "200".into());
+        // Second reload: outside did not touch delay again.
+        let got = merge_form(&base, &mine, &base, &[Field::Delay]);
+        assert_eq!(
+            got,
+            Merged {
+                form: mine.clone(),
+                conflicts: vec![Field::Delay]
+            }
+        );
+        // Without the pending mark the field would silently stop being a conflict.
+        assert!(merge_form(&base, &mine, &base, &[]).conflicts.is_empty());
+        // Typing the outside value resolves it.
+        let same = merge_form(&base, &base, &base, &[Field::Delay]);
+        assert!(same.conflicts.is_empty());
+    }
+
+    #[test]
+    fn take_fields_changes_only_the_given_fields() {
+        let mine = with(|f| {
+            f.delay = "200".into();
+            f.offsets[0] = "5".into();
+            f.enabled = false;
+            f.island = Some("a/x".into());
+        });
+        let theirs = with(|f| {
+            f.delay = "300".into();
+            f.offsets[0] = "9".into();
+            f.enabled = true;
+            f.island = None;
+            f.monitor = MonitorChoice::Index(3);
+        });
+        let got = take_fields(&mine, &theirs, &[Field::Delay, Field::Island]);
+        let want = FormInput {
+            delay: "300".into(),
+            island: None,
+            ..mine.clone()
+        };
+        assert_eq!(got, want);
+        assert_eq!(take_fields(&mine, &theirs, &[]), mine);
+    }
+
+    #[test]
+    fn outside_value_is_readable() {
+        let theirs = with(|f| {
+            f.delay = " 300 ".into();
+            f.offsets[3] = "-4".into();
+            f.monitor = MonitorChoice::Index(2);
+            f.enabled = false;
+        });
+        for (l, none, current, empty, yes, no, mon) in [
+            (
+                Locale::En,
+                "No island",
+                "Current",
+                "(empty)",
+                "Enabled: yes",
+                "Enabled: no",
+                "Monitor 2",
+            ),
+            (
+                Locale::Es,
+                "Sin isla",
+                "Actual",
+                "(vac\u{ed}o)",
+                "Activado: s\u{ed}",
+                "Activado: no",
+                "Monitor 2",
+            ),
+        ] {
+            let _g = i18n::scoped_locale(l);
+            assert_eq!(outside_value(&theirs, Field::Island), none);
+            assert_eq!(outside_value(&theirs, Field::Width), empty);
+            assert_eq!(outside_value(&theirs, Field::Monitor), mon);
+            assert_eq!(outside_value(&FormInput::blank(), Field::Monitor), current);
+            assert_eq!(outside_value(&theirs, Field::Enabled), no);
+            assert_eq!(outside_value(&FormInput::blank(), Field::Enabled), yes);
+            assert_eq!(outside_value(&theirs, Field::Delay), "300");
+            assert_eq!(outside_value(&theirs, Field::Bottom), "-4");
+            let isl = with(|f| f.island = Some("l/i".into()));
+            assert_eq!(outside_value(&isl, Field::Island), "l/i");
+        }
+    }
+
+    // ---------------------------------------------------------- properties
+
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngSeed};
+
+    fn cfg() -> ProptestConfig {
+        ProptestConfig {
+            rng_seed: RngSeed::Fixed(0xB0_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    /// Small domains so base/mine/theirs collide often; padded values test the `trim()` rule.
+    fn any_form() -> impl Strategy<Value = FormInput> {
+        let txt = prop::sample::select(vec!["0", "5", " 5 ", "7", ""]);
+        let island = prop::option::of(prop::sample::select(vec!["a/x", "b/y"]));
+        let monitor = prop_oneof![
+            Just(MonitorChoice::Current),
+            (0usize..3).prop_map(MonitorChoice::Index)
+        ];
+        (
+            any::<bool>(),
+            island,
+            monitor,
+            [txt.clone(), txt.clone(), txt.clone(), txt.clone()],
+            (txt.clone(), txt.clone(), txt),
+        )
+            .prop_map(
+                |(enabled, island, monitor, o, (delay, width, height))| FormInput {
+                    process: "g.exe".into(),
+                    enabled,
+                    island: island.map(String::from),
+                    monitor,
+                    offsets: o.map(String::from),
+                    delay: delay.into(),
+                    width: width.into(),
+                    height: height.into(),
+                },
+            )
+    }
+
+    const ALL: [Field; 11] = [
+        Field::Process,
+        Field::Enabled,
+        Field::Island,
+        Field::Monitor,
+        Field::Left,
+        Field::Top,
+        Field::Right,
+        Field::Bottom,
+        Field::Delay,
+        Field::Width,
+        Field::Height,
+    ];
+
+    proptest! {
+        #![proptest_config(cfg())]
+
+        #[test]
+        fn no_outside_change_keeps_the_form(b in any_form(), m in any_form()) {
+            let got = merge_form(&b, &m, &b, &[]);
+            prop_assert_eq!(trimmed(&got.form), trimmed(&m));
+            prop_assert!(got.conflicts.is_empty());
+        }
+
+        #[test]
+        fn no_local_edit_takes_the_outside_form(b in any_form(), t in any_form()) {
+            let got = merge_form(&b, &b, &t, &[]);
+            prop_assert_eq!(trimmed(&got.form), trimmed(&t));
+            prop_assert!(got.conflicts.is_empty());
+        }
+
+        #[test]
+        fn conflicts_are_real_and_everything_else_is_one_side(
+            b in any_form(), m in any_form(), t in any_form(),
+            pend in prop::sample::subsequence(ALL.to_vec(), 0..=11),
+        ) {
+            let got = merge_form(&b, &m, &t, &pend);
+            for f in ALL {
+                let on_mine = take_fields(&got.form, &m, &[f]) == got.form;
+                let on_theirs = take_fields(&got.form, &t, &[f]) == got.form;
+                if got.conflicts.contains(&f) {
+                    prop_assert!(!same_field(&m, &t, f));
+                    prop_assert!(pend.contains(&f)
+                        || (!same_field(&m, &b, f) && !same_field(&t, &b, f)));
+                    prop_assert!(on_mine);
+                } else {
+                    prop_assert!(on_mine || on_theirs);
+                }
+            }
+        }
     }
 }
