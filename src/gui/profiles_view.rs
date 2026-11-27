@@ -399,7 +399,7 @@ pub fn warning_text(w: &Warning) -> String {
 pub enum OutsideChange {
     /// The edited profile is the same in the new data: the form stays as typed.
     None,
-    /// It changed outside: the form must be refilled from this version.
+    /// It changed outside: merge it into the form (see [`after_reload`]).
     Changed(Profile),
     /// It was removed outside: saving the form creates it again.
     Removed,
@@ -482,10 +482,21 @@ fn copy_field(dst: &mut FormInput, src: &FormInput, field: Field) {
     }
 }
 
+/// Fields the form ignores while an island is set (`build_profile`).
+const ISLAND_COUPLED: [Field; 5] = [
+    Field::Monitor,
+    Field::Left,
+    Field::Top,
+    Field::Right,
+    Field::Bottom,
+];
+
 /// Three-way merge per field of the typed form (`mine`) with the reloaded profile (`theirs`)
 /// over the saved version it was opened on (`base`). A field changed on both sides to different
 /// values is a conflict and keeps `mine`; `pending` conflicts from an earlier merge stay
-/// conflicts unless both sides now agree.
+/// conflicts unless both sides now agree. Fields the profile couples are merged together: an
+/// island changed on one side clashes with offsets or monitor changed on the other, and
+/// width/height are one resolution, so no typed value is lost silently.
 pub fn merge_form(
     base: &FormInput,
     mine: &FormInput,
@@ -493,20 +504,83 @@ pub fn merge_form(
     pending: &[Field],
 ) -> Merged {
     let mut form = mine.clone();
-    let mut conflicts = Vec::new();
+    let mut marked = Vec::new();
     for field in MERGE_FIELDS {
         if same_field(mine, theirs, field) {
             continue;
         }
         if pending.contains(&field) {
-            conflicts.push(field);
+            marked.push(field);
         } else if same_field(mine, base, field) {
             copy_field(&mut form, theirs, field);
         } else if !same_field(theirs, base, field) {
-            conflicts.push(field);
+            marked.push(field);
         }
     }
+    let changed = |side: &FormInput, field| !same_field(side, base, field);
+    let differs = |field| !same_field(mine, theirs, field);
+    if differs(Field::Island) {
+        for (island_side, other) in [(mine, theirs), (theirs, mine)] {
+            if !changed(island_side, Field::Island) {
+                continue;
+            }
+            let hit: Vec<Field> = ISLAND_COUPLED
+                .into_iter()
+                .filter(|&f| changed(other, f) && differs(f))
+                .collect();
+            if !hit.is_empty() {
+                marked.push(Field::Island);
+                marked.extend(hit);
+            }
+        }
+    }
+    let pair_changed = |side| changed(side, Field::Width) || changed(side, Field::Height);
+    if pair_changed(mine)
+        && pair_changed(theirs)
+        && (differs(Field::Width) || differs(Field::Height))
+    {
+        marked.extend([Field::Width, Field::Height]);
+    }
+    let conflicts: Vec<Field> = MERGE_FIELDS
+        .into_iter()
+        .filter(|f| marked.contains(f))
+        .collect();
+    for &field in &conflicts {
+        copy_field(&mut form, mine, field);
+    }
     Merged { form, conflicts }
+}
+
+/// What the open editor does after a reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// Leave the form as typed.
+    Keep,
+    /// Reopen the form with this merge.
+    Merge(Box<Merged>),
+    /// The profile is gone outside: forget the base and the conflicts.
+    Removed,
+}
+
+/// Decides what a reload does to the form `mine`. Without a `base` (cannot happen for an edit)
+/// every field that differs is a conflict that keeps `mine`: nothing is taken silently.
+pub fn after_reload(
+    base: Option<&FormInput>,
+    mine: &FormInput,
+    pending: &[Field],
+    change: &OutsideChange,
+) -> ReloadOutcome {
+    match change {
+        OutsideChange::None => ReloadOutcome::Keep,
+        OutsideChange::Removed => ReloadOutcome::Removed,
+        OutsideChange::Changed(p) => {
+            let theirs = FormInput::from_profile(p);
+            ReloadOutcome::Merge(Box::new(match base {
+                Some(b) => merge_form(b, mine, &theirs, pending),
+                None => merge_form(mine, mine, &theirs, &MERGE_FIELDS),
+            }))
+        }
+    }
 }
 
 /// `form` with the given `fields` replaced by the ones in `theirs`.
@@ -518,13 +592,14 @@ pub fn take_fields(form: &FormInput, theirs: &FormInput, fields: &[Field]) -> Fo
     out
 }
 
-/// The outside value of `field`, readable in the active language.
-pub fn outside_value(theirs: &FormInput, field: Field) -> String {
+/// The outside value of `field`, readable in the active language. An island shows the ref the
+/// pickers show (canonical in `layouts`).
+pub fn outside_value(theirs: &FormInput, field: Field, layouts: &[Layout]) -> String {
     match field {
         Field::Enabled if theirs.enabled => i18n::t("profiles.editor.enabled_yes").into_owned(),
         Field::Enabled => i18n::t("profiles.editor.enabled_no").into_owned(),
         Field::Island => match theirs.island.as_deref().map(str::trim) {
-            Some(i) if !i.is_empty() => i.to_owned(),
+            Some(i) if !i.is_empty() => shown_ref(layouts, i),
             _ => i18n::t("profiles.editor.no_island").into_owned(),
         },
         Field::Monitor => match theirs.monitor {
@@ -793,24 +868,21 @@ impl ProfilesView {
                         t.error = None;
                         t.read_only = false;
                         // Never keep stale form values silently over an outside change.
-                        let change = match (&t.editor, &t.data) {
-                            (Some(e), Some(old)) => {
-                                outside_change(e.original.as_deref(), &old.profiles, &d.profiles)
+                        let outcome = match (&t.editor, &t.data, t.form(cx)) {
+                            (Some(e), Some(old), Some(mine)) => {
+                                let change = outside_change(
+                                    e.original.as_deref(),
+                                    &old.profiles,
+                                    &d.profiles,
+                                );
+                                after_reload(e.base.as_ref(), &mine, &e.conflicts, &change)
                             }
-                            _ => OutsideChange::None,
+                            _ => ReloadOutcome::Keep,
                         };
-                        match change {
-                            OutsideChange::None => {}
-                            OutsideChange::Changed(p) => {
-                                if let (Some(e), Some(mine)) = (&t.editor, t.form(cx)) {
-                                    // No base cannot happen for an edit; merging over `mine`
-                                    // then takes every outside value, never overwrites one.
-                                    let base = e.base.as_ref().unwrap_or(&mine);
-                                    let theirs = FormInput::from_profile(&p);
-                                    t.refill = Some(merge_form(base, &mine, &theirs, &e.conflicts));
-                                }
-                            }
-                            OutsideChange::Removed => {
+                        match outcome {
+                            ReloadOutcome::Keep => {}
+                            ReloadOutcome::Merge(m) => t.refill = Some(*m),
+                            ReloadOutcome::Removed => {
                                 if let Some(e) = &mut t.editor {
                                     e.base = None;
                                     e.conflicts.clear();
@@ -951,6 +1023,11 @@ impl ProfilesView {
         else {
             return;
         };
+        // A merge is waiting to reopen the form: this form is stale, saving it would skip the
+        // marked conflicts.
+        if self.refill.is_some() {
+            return;
+        }
         // Pending conflicts are resolved only by the banner buttons, never by a plain save.
         if !e.conflicts.is_empty() {
             return;
@@ -1461,7 +1538,7 @@ impl ProfilesView {
             e.base
                 .as_ref()
                 .filter(|_| e.conflicts.contains(&f))
-                .map(|b| outside_value(b, f))
+                .map(|b| outside_value(b, f, &d.layouts))
         };
         let has_island = e.island.is_some();
         let title = if e.original.is_some() {
@@ -2283,6 +2360,89 @@ mod tests {
     }
 
     #[test]
+    fn merge_marks_offsets_typed_while_an_island_was_set_outside() {
+        let base = form("g.exe");
+        let mine = with(|f| f.offsets[0] = "5".into());
+        let theirs = with(|f| f.island = Some("l/i".into()));
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        assert_eq!(got.conflicts, [Field::Island, Field::Left]);
+        assert_eq!(got.form, mine);
+        let mine = with(|f| f.monitor = MonitorChoice::Index(1));
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        assert_eq!(got.conflicts, [Field::Island, Field::Monitor]);
+        assert_eq!(got.form, mine);
+    }
+
+    #[test]
+    fn merge_marks_an_island_typed_over_offsets_changed_outside() {
+        let base = form("g.exe");
+        let mine = with(|f| f.island = Some("l/i".into()));
+        let theirs = with(|f| {
+            f.offsets[1] = "7".into();
+            f.monitor = MonitorChoice::Index(2);
+        });
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        assert_eq!(got.conflicts, [Field::Island, Field::Monitor, Field::Top]);
+        assert_eq!(got.form, mine);
+    }
+
+    #[test]
+    fn merge_does_not_couple_an_island_both_sides_agree_on() {
+        let base = form("g.exe");
+        let mine = with(|f| f.island = Some("l/i".into()));
+        let theirs = with(|f| {
+            f.island = Some("l/i".into());
+            f.offsets[1] = "7".into();
+        });
+        assert!(merge_form(&base, &mine, &theirs, &[]).conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_treats_width_and_height_as_a_pair() {
+        let base = form("g.exe");
+        let mine = with(|f| f.width = "1280".into());
+        let theirs = with(|f| f.height = "1440".into());
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        assert_eq!(got.conflicts, [Field::Width, Field::Height]);
+        assert_eq!(got.form, mine);
+        // One side changing the pair is not a clash: both halves travel together.
+        let got = merge_form(&base, &base, &with(|f| f.width = "1280".into()), &[]);
+        assert!(got.conflicts.is_empty());
+        // Both sides agreeing on the pair is no clash either.
+        let same = with(|f| {
+            f.width = "1280".into();
+            f.height = "720".into();
+        });
+        assert!(merge_form(&base, &same, &same, &[]).conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_takes_a_padded_island_as_the_same_island() {
+        let base = form("g.exe");
+        let mine = with(|f| f.island = Some(" l/i ".into()));
+        let theirs = with(|f| f.island = Some("l/i".into()));
+        assert!(merge_form(&base, &mine, &theirs, &[]).conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_takes_a_process_changed_outside() {
+        let base = form("g.exe");
+        let theirs = form("h.exe");
+        let got = merge_form(&base, &base, &theirs, &[]);
+        assert_eq!(got.form.process, "h.exe");
+        assert!(got.conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_keeps_a_pending_field_in_conflict_when_outside_changes_again() {
+        let base = form("g.exe");
+        let theirs = with(|f| f.delay = "300".into());
+        let got = merge_form(&base, &base, &theirs, &[Field::Delay]);
+        assert_eq!(got.conflicts, [Field::Delay]);
+        assert_eq!(got.form, base);
+    }
+
+    #[test]
     fn take_fields_changes_only_the_given_fields() {
         let mine = with(|f| {
             f.delay = "200".into();
@@ -2315,38 +2475,136 @@ mod tests {
             f.monitor = MonitorChoice::Index(2);
             f.enabled = false;
         });
-        for (l, none, current, empty, yes, no, mon) in [
-            (
-                Locale::En,
-                "No island",
-                "Current",
-                "(empty)",
-                "Enabled: yes",
-                "Enabled: no",
-                "Monitor 2",
-            ),
-            (
-                Locale::Es,
-                "Sin isla",
-                "Actual",
-                "(vac\u{ed}o)",
-                "Activado: s\u{ed}",
-                "Activado: no",
-                "Monitor 2",
-            ),
-        ] {
+        let isl = with(|f| f.island = Some(" l/i ".into()));
+        let texts = |l: Locale| {
             let _g = i18n::scoped_locale(l);
-            assert_eq!(outside_value(&theirs, Field::Island), none);
-            assert_eq!(outside_value(&theirs, Field::Width), empty);
-            assert_eq!(outside_value(&theirs, Field::Monitor), mon);
-            assert_eq!(outside_value(&FormInput::blank(), Field::Monitor), current);
-            assert_eq!(outside_value(&theirs, Field::Enabled), no);
-            assert_eq!(outside_value(&FormInput::blank(), Field::Enabled), yes);
-            assert_eq!(outside_value(&theirs, Field::Delay), "300");
-            assert_eq!(outside_value(&theirs, Field::Bottom), "-4");
-            let isl = with(|f| f.island = Some("l/i".into()));
-            assert_eq!(outside_value(&isl, Field::Island), "l/i");
+            [
+                outside_value(&theirs, Field::Island, &[]),
+                outside_value(&theirs, Field::Width, &[]),
+                outside_value(&theirs, Field::Monitor, &[]),
+                outside_value(&FormInput::blank(), Field::Monitor, &[]),
+                outside_value(&theirs, Field::Enabled, &[]),
+                outside_value(&FormInput::blank(), Field::Enabled, &[]),
+            ]
+        };
+        let en = texts(Locale::En);
+        assert_eq!(
+            en,
+            [
+                "No island",
+                "(empty)",
+                "Monitor 2",
+                "Current",
+                "Enabled: no",
+                "Enabled: yes"
+            ]
+        );
+        // Spanish is not pinned: it must exist, differ from English and not be the raw key.
+        for (i, es) in texts(Locale::Es).into_iter().enumerate() {
+            // "Monitor 2" is the same word in both languages.
+            if i != 2 {
+                assert_ne!(es, en[i], "{es}");
+            }
+            assert!(!es.starts_with("profiles."), "{es}");
         }
+        for l in [Locale::En, Locale::Es] {
+            let _g = i18n::scoped_locale(l);
+            assert_eq!(outside_value(&theirs, Field::Delay, &[]), "300");
+            assert_eq!(outside_value(&theirs, Field::Bottom, &[]), "-4");
+            assert_eq!(outside_value(&isl, Field::Island, &[]), "l/i");
+        }
+    }
+
+    #[test]
+    fn outside_value_shows_the_canonical_island_ref() {
+        let layouts = merged_layouts(&[]);
+        let legacy = with(|f| f.island = Some(" mitades-16-9/derecha ".into())); // legacy alias
+        assert_eq!(
+            outside_value(&legacy, Field::Island, &layouts),
+            "halves-16-9/right"
+        );
+        let gone = with(|f| f.island = Some("gone/x".into()));
+        assert_eq!(outside_value(&gone, Field::Island, &layouts), "gone/x");
+    }
+
+    // ---------------------------------------------------------- reload
+
+    #[test]
+    fn after_reload_keeps_the_form_when_nothing_changed() {
+        let mine = with(|f| f.delay = "200".into());
+        let got = after_reload(Some(&form("g.exe")), &mine, &[], &OutsideChange::None);
+        assert_eq!(got, ReloadOutcome::Keep);
+    }
+
+    #[test]
+    fn after_reload_forgets_the_base_when_the_profile_is_removed() {
+        let mine = form("g.exe");
+        let got = after_reload(Some(&mine), &mine, &[Field::Delay], &OutsideChange::Removed);
+        assert_eq!(got, ReloadOutcome::Removed);
+    }
+
+    #[test]
+    fn after_reload_merges_over_the_base() {
+        let base = form("g.exe");
+        let mine = with(|f| f.delay = "200".into());
+        let mut p = prof("g.exe");
+        p.offsets.top = 7;
+        let got = after_reload(Some(&base), &mine, &[], &OutsideChange::Changed(p));
+        let want = with(|f| {
+            f.delay = "200".into();
+            f.offsets[1] = "7".into();
+        });
+        assert_eq!(
+            got,
+            ReloadOutcome::Merge(Box::new(Merged {
+                form: want,
+                conflicts: vec![]
+            }))
+        );
+    }
+
+    #[test]
+    fn after_reload_passes_the_pending_conflicts_through() {
+        // Delay conflicted before (mine 200); outside did not touch it again.
+        let base = form("g.exe");
+        let mine = with(|f| f.delay = "200".into());
+        let change = OutsideChange::Changed(prof("g.exe"));
+        let kept = after_reload(Some(&base), &mine, &[Field::Delay], &change);
+        assert_eq!(
+            kept,
+            ReloadOutcome::Merge(Box::new(Merged {
+                form: mine.clone(),
+                conflicts: vec![Field::Delay]
+            }))
+        );
+        // Same inputs without the pending mark: the conflict would vanish.
+        let dropped = after_reload(Some(&base), &mine, &[], &change);
+        assert_eq!(
+            dropped,
+            ReloadOutcome::Merge(Box::new(Merged {
+                form: mine,
+                conflicts: vec![]
+            }))
+        );
+    }
+
+    #[test]
+    fn after_reload_without_a_base_keeps_mine_and_marks_every_difference() {
+        let mine = with(|f| {
+            f.delay = "200".into();
+            f.offsets[0] = "5".into();
+        });
+        let mut p = prof("g.exe");
+        p.delay_ms = 300;
+        p.offsets.top = 7;
+        let got = after_reload(None, &mine, &[], &OutsideChange::Changed(p));
+        assert_eq!(
+            got,
+            ReloadOutcome::Merge(Box::new(Merged {
+                form: mine,
+                conflicts: vec![Field::Left, Field::Top, Field::Delay]
+            }))
+        );
     }
 
     // ---------------------------------------------------------- properties
@@ -2391,20 +2649,6 @@ mod tests {
             )
     }
 
-    const ALL: [Field; 11] = [
-        Field::Process,
-        Field::Enabled,
-        Field::Island,
-        Field::Monitor,
-        Field::Left,
-        Field::Top,
-        Field::Right,
-        Field::Bottom,
-        Field::Delay,
-        Field::Width,
-        Field::Height,
-    ];
-
     proptest! {
         #![proptest_config(cfg())]
 
@@ -2425,19 +2669,29 @@ mod tests {
         #[test]
         fn conflicts_are_real_and_everything_else_is_one_side(
             b in any_form(), m in any_form(), t in any_form(),
-            pend in prop::sample::subsequence(ALL.to_vec(), 0..=11),
+            pend in prop::sample::subsequence(MERGE_FIELDS.to_vec(), 0..=11),
         ) {
             let got = merge_form(&b, &m, &t, &pend);
-            for f in ALL {
+            for f in MERGE_FIELDS {
                 let on_mine = take_fields(&got.form, &m, &[f]) == got.form;
                 let on_theirs = take_fields(&got.form, &t, &[f]) == got.form;
                 if got.conflicts.contains(&f) {
-                    prop_assert!(!same_field(&m, &t, f));
-                    prop_assert!(pend.contains(&f)
-                        || (!same_field(&m, &b, f) && !same_field(&t, &b, f)));
                     prop_assert!(on_mine);
                 } else {
                     prop_assert!(on_mine || on_theirs);
+                }
+            }
+        }
+
+        #[test]
+        fn a_field_the_user_changed_never_silently_differs_from_mine(
+            b in any_form(), m in any_form(), t in any_form(),
+            pend in prop::sample::subsequence(MERGE_FIELDS.to_vec(), 0..=11),
+        ) {
+            let got = merge_form(&b, &m, &t, &pend);
+            for f in MERGE_FIELDS {
+                if !same_field(&m, &b, f) {
+                    prop_assert!(same_field(&got.form, &m, f) || got.conflicts.contains(&f));
                 }
             }
         }
