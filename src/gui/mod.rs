@@ -142,6 +142,10 @@ pub async fn ipc_call<T: Send + 'static>(
     cx: &mut AsyncApp,
     f: impl FnOnce(&mut Client) -> Result<T, CallError> + Send + 'static,
 ) -> Result<T, String> {
+    // Headless view tests must never reach a real resident's pipe.
+    if cfg!(test) {
+        return Err(i18n::t("common.error.resident_unreachable").into_owned());
+    }
     cx.background_executor()
         .spawn(async move {
             let mut c = Client::connect(Duration::from_millis(500))
@@ -164,6 +168,9 @@ pub async fn call<T: Send + 'static>(
     cx: &mut AsyncApp,
     f: impl FnOnce(&mut Client) -> Result<Reply<T>, CallError> + Send + 'static,
 ) -> Result<T, Failure> {
+    if cfg!(test) {
+        return Err(Failure::Down);
+    }
     cx.background_executor()
         .spawn(async move {
             let mut c = Client::connect(Duration::from_millis(500)).map_err(|_| Failure::Down)?;

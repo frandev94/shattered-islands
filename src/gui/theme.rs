@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -367,6 +368,8 @@ impl RenderOnce for Btn {
                     .focus_visible(|s| s.shadow(focus_ring()))
                     .on_click(on_click)
             })
+            // Lets headless UI tests find and click it by id; a no-op in normal builds.
+            .test_support()
     }
 }
 

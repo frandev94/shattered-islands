@@ -880,51 +880,50 @@ impl ProfilesView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let r = ipc_call(cx, load).await;
-            this.update(cx, |t, cx| {
-                t.loading = false;
-                match r {
-                    Ok(Reply::Ok(d)) => {
-                        t.error = None;
-                        t.read_only = false;
-                        // Never keep stale form values silently over an outside change.
-                        let outcome = match (&t.editor, &t.data, t.form(cx)) {
-                            (Some(e), Some(old), Some(mine)) => {
-                                let change = outside_change(
-                                    e.original.as_deref(),
-                                    &old.profiles,
-                                    &d.profiles,
-                                );
-                                after_reload(e.base.as_ref(), &mine, &e.conflicts, &change)
-                            }
-                            _ => ReloadOutcome::Keep,
-                        };
-                        match outcome {
-                            ReloadOutcome::Keep => {}
-                            ReloadOutcome::Merge(m) => t.refill = Some(*m),
-                            ReloadOutcome::Removed => {
-                                if let Some(e) = &mut t.editor {
-                                    e.base = None;
-                                    e.conflicts.clear();
-                                    t.outside = e
-                                        .original
-                                        .take()
-                                        .map(|o| Notice::new("profiles.outside.removed", &o));
-                                }
-                            }
-                        }
-                        t.data = Some(d);
-                    }
-                    Ok(Reply::Remote(b)) => {
-                        t.read_only = b.code == ErrorCode::UnsupportedVersion;
-                        t.error = Some(format!("{} ({})", remote_message(&b), code_str(b.code)));
-                    }
-                    Err(e) => t.error = Some(e),
-                }
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |t, cx| t.apply_load(r, cx)).ok();
         })
         .detach();
+    }
+
+    /// A finished `load`: keep its data, and never keep stale form values silently over an
+    /// outside change.
+    fn apply_load(&mut self, r: Result<Reply<Data>, String>, cx: &mut Context<Self>) {
+        self.loading = false;
+        match r {
+            Ok(Reply::Ok(d)) => {
+                self.error = None;
+                self.read_only = false;
+                let outcome = match (&self.editor, &self.data, self.form(cx)) {
+                    (Some(e), Some(old), Some(mine)) => {
+                        let change =
+                            outside_change(e.original.as_deref(), &old.profiles, &d.profiles);
+                        after_reload(e.base.as_ref(), &mine, &e.conflicts, &change)
+                    }
+                    _ => ReloadOutcome::Keep,
+                };
+                match outcome {
+                    ReloadOutcome::Keep => {}
+                    ReloadOutcome::Merge(m) => self.refill = Some(*m),
+                    ReloadOutcome::Removed => {
+                        if let Some(e) = &mut self.editor {
+                            e.base = None;
+                            e.conflicts.clear();
+                            self.outside = e
+                                .original
+                                .take()
+                                .map(|o| Notice::new("profiles.outside.removed", &o));
+                        }
+                    }
+                }
+                self.data = Some(d);
+            }
+            Ok(Reply::Remote(b)) => {
+                self.read_only = b.code == ErrorCode::UnsupportedVersion;
+                self.error = Some(format!("{} ({})", remote_message(&b), code_str(b.code)));
+            }
+            Err(e) => self.error = Some(e),
+        }
+        cx.notify();
     }
 
     fn open_editor(
@@ -2636,6 +2635,134 @@ mod tests {
                 form: mine,
                 conflicts: vec![Field::Left, Field::Top, Field::Delay]
             }))
+        );
+    }
+
+    // ---------------------------------------------------------- headless view (GPUI test platform)
+
+    use gpui_kit::base::test_support::{ElementSnapshot, find};
+    use gpui_kit::{
+        Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size,
+    };
+
+    /// The panel's Profiles view in a headless test window, set up as `gui::run` does.
+    fn open_view(cx: &mut TestAppContext) -> (VisualTestContext, Entity<ProfilesView>) {
+        let (win, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::gui::theme::install(cx);
+            let opts = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Default::default(),
+                    size: size(px(1200.), px(2000.)),
+                })),
+                ..Default::default()
+            };
+            gpui_kit::open_window(opts, cx, |w, cx| cx.new(|cx| ProfilesView::new(w, cx))).unwrap()
+        });
+        (VisualTestContext::from_window(win, cx), view)
+    }
+
+    /// The element registered as `id` (`.test_support()`) in the last frame, if any.
+    fn element(cx: &mut VisualTestContext, id: &'static str) -> Option<ElementSnapshot> {
+        cx.update(|w, _| find(w, &[], &id.into()))
+    }
+
+    /// A left click at the centre of the element `id`, as the mouse would do it.
+    fn click(cx: &mut VisualTestContext, id: &'static str) {
+        let at = element(cx, id)
+            .unwrap_or_else(|| panic!("{id} is not on screen"))
+            .bounds()
+            .center();
+        cx.simulate_click(at, Modifiers::none());
+    }
+
+    #[gpui_kit::test]
+    fn the_profiles_view_renders_headless(cx: &mut TestAppContext) {
+        let (mut cx, _view) = open_view(cx);
+        cx.run_until_parked();
+        assert!(element(&mut cx, "refresh").is_some_and(|e| e.visible()));
+        assert!(element(&mut cx, "new-profile").is_some_and(|e| e.visible()));
+    }
+
+    /// What `load` returns for one profile, `game.exe`, saved with `delay_ms`.
+    fn loaded(delay_ms: u64, revision: &str) -> Result<Reply<Data>, String> {
+        let mut p = prof("game.exe");
+        p.delay_ms = delay_ms;
+        Ok(Reply::Ok(Data {
+            path: "profiles.json".into(),
+            revision: revision.into(),
+            profiles: vec![p],
+            warnings: Vec::new(),
+            layouts: Vec::new(),
+            islands: Vec::new(),
+            monitors: Vec::new(),
+            processes: Vec::new(),
+        }))
+    }
+
+    /// The open editor's Delay text and conflicting fields.
+    fn delay_and_conflicts(
+        cx: &mut VisualTestContext,
+        view: &Entity<ProfilesView>,
+    ) -> (String, Vec<Field>) {
+        cx.update(|_, app| {
+            let e = view.read(app).editor.as_ref().expect("editor open");
+            (e.delay.read(app).value().to_string(), e.conflicts.clone())
+        })
+    }
+
+    /// #15: the editor is open on game.exe (delay 100), 200 is typed in Delay, and a reload
+    /// brings 300 saved outside for the same field.
+    fn typed_over_an_outside_change(
+        cx: &mut TestAppContext,
+    ) -> (VisualTestContext, Entity<ProfilesView>) {
+        let (mut cx, view) = open_view(cx);
+        cx.run_until_parked(); // the first refresh fails: tests never reach a resident
+        cx.update(|_, app| view.update(app, |v, cx| v.apply_load(loaded(100, "r1"), cx)));
+        click(&mut cx, "edit-0");
+        cx.update(|w, app| {
+            let delay = view
+                .read(app)
+                .editor
+                .as_ref()
+                .expect("editor open")
+                .delay
+                .clone();
+            delay.update(app, |s, cx| s.focus(w, cx));
+        });
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("200");
+        assert_eq!(delay_and_conflicts(&mut cx, &view), ("200".into(), vec![]));
+        cx.update(|_, app| view.update(app, |v, cx| v.apply_load(loaded(300, "r2"), cx)));
+        // The typed value stays, the field is marked and both ways out are offered.
+        assert_eq!(
+            delay_and_conflicts(&mut cx, &view),
+            ("200".into(), vec![Field::Delay])
+        );
+        assert!(element(&mut cx, "merge-keep-mine").is_some_and(|e| e.visible()));
+        assert!(element(&mut cx, "merge-use-theirs").is_some_and(|e| e.visible()));
+        (cx, view)
+    }
+
+    #[gpui_kit::test]
+    fn use_the_outside_values_takes_the_outside_delay(cx: &mut TestAppContext) {
+        let (mut cx, view) = typed_over_an_outside_change(cx);
+        click(&mut cx, "merge-use-theirs");
+        assert_eq!(delay_and_conflicts(&mut cx, &view), ("300".into(), vec![]));
+        assert!(element(&mut cx, "merge-keep-mine").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn keep_mine_and_overwrite_saves_the_typed_delay(cx: &mut TestAppContext) {
+        let (mut cx, view) = typed_over_an_outside_change(cx);
+        click(&mut cx, "merge-keep-mine");
+        assert_eq!(delay_and_conflicts(&mut cx, &view), ("200".into(), vec![]));
+        assert!(element(&mut cx, "merge-keep-mine").is_none());
+        // The save went out (tests have no resident, so it fails there) and kept the form.
+        let save_error = cx.update(|_, app| view.read(app).save_error.clone());
+        assert_eq!(
+            save_error.as_deref(),
+            Some(&*i18n::t("common.error.resident_unreachable"))
         );
     }
 

@@ -21,6 +21,11 @@ gpui-kit = { version = "=0.11.0", default-features = false, features = ["compone
 
 [dev-dependencies]
 proptest = "1"
+# Headless GPUI views in `cargo test`. gpui-kit's own `test-support` would pull gpui-fast-platform
+# into Cargo.lock and pin wgpu =30.0.1 for the release build too, so the features go on its crates.
+gpui-pre = { version = "=0.3.14", features = ["test-support"] }
+gpui-base = { version = "=0.11.0", features = ["test-support"] }
+gpui-component = { version = "=0.11.0", features = ["test-support"] }
 
 [profile.release]
 lto = true
