@@ -30,7 +30,9 @@ does), and do not touch the keyboard or mouse while they run. Each case gets its
 running resident before it. The tiers and what each needs are listed in `AGENTS.md`, "Testing & QA".
 
 Before a PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and
-`cargo deny check licenses` must pass; these are the checks CI runs (`.github/workflows/test.yml`).
+`cargo deny check licenses` must pass; these are the checks CI runs (`.github/workflows/test.yml`). That workflow
+runs on pull requests, on demand (Actions tab, `workflow_dispatch`) and when `release.yml` calls it; a push to
+`main` outside the release paths is not tested again.
 
 ## e2e on GitHub Actions
 
@@ -138,7 +140,8 @@ Use this for a forced version level, or to release docs-only changes.
 6. `git add Cargo.toml Cargo.lock CHANGELOG.md`, commit `chore(release): vX.Y.Z` (the workflow skips that
    message), then `git tag -a vX.Y.Z -m "borderless-shatter vX.Y.Z"`. Commit with the identity configured in
    the checkout.
-7. `cargo build --release --locked`, then the `.sha256` (`sha256sum` run inside `target/release`), before
+7. `cargo build --release --locked`, then the `.sha256` (`sha256sum --text borderless-shatter.exe > borderless-shatter.exe.sha256`
+   run inside `target/release`; `--text` keeps Windows from writing `*` before the name), before
    pushing, so a broken build leaves no tag. Push in one atomic push: `git push --atomic origin main vX.Y.Z`.
    Then `gh release create vX.Y.Z --title vX.Y.Z --notes-file <(git cliff --latest --strip all) target/release/borderless-shatter.exe target/release/borderless-shatter.exe.sha256`.
 
@@ -155,7 +158,7 @@ Never move or delete a pushed tag; a wrong release gets a new release.
   `gh run download <run-id> -n release -D rel`, then
   `gh release create vX.Y.Z --title vX.Y.Z --notes-file rel/notes.md rel/borderless-shatter.exe rel/borderless-shatter.exe.sha256`.
   If the artifact has expired, build from the tag instead: `cargo build --release --locked` on a checkout of
-  `vX.Y.Z`, run `sha256sum` inside `target/release`, and attach those files. Then re-run the blocked
+  `vX.Y.Z`, run `sha256sum --text borderless-shatter.exe > borderless-shatter.exe.sha256` inside `target/release`, and attach those files. Then re-run the blocked
   `publish` job, or let the next push release.
 
 ## Clean-room and licence

@@ -140,7 +140,8 @@ jobs:
           git cliff --unreleased --tag "$V" --strip all > "$out/notes.md"
           cargo build --release --locked
           cp target/release/borderless-shatter.exe Cargo.toml Cargo.lock CHANGELOG.md "$out/"
-          (cd "$out" && sha256sum borderless-shatter.exe > borderless-shatter.exe.sha256 && cat borderless-shatter.exe.sha256)
+          # --text: Windows sha256sum defaults to binary mode and writes `<hash> *name`; the asset is documented as `<hash>  name`.
+          (cd "$out" && sha256sum --text borderless-shatter.exe > borderless-shatter.exe.sha256 && cat borderless-shatter.exe.sha256)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ steps.version.outputs.version != '' }}
         with:

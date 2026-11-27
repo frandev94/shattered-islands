@@ -1,14 +1,11 @@
 name: test
 
-# Pull requests always run it. A push to main runs it here when it touches anything outside the paths
-# below; release.yml calls this workflow for pushes touching those paths. A push touching both
-# (src/ plus docs) is therefore tested twice: path filters cannot express
-# "none of these files changed".
+# Runs on pull requests, on demand (workflow_dispatch) and when release.yml calls it for a push to main
+# that touches the release paths. Pushes to main that skip the release paths are not tested here:
+# every change reaches main through a pull request that already ran it.
 on:
   pull_request:
-  push:
-    branches: [main]
-    paths-ignore: [src/**, locales/**, Cargo.toml, Cargo.lock]
+  workflow_dispatch:
   workflow_call:
     outputs:
       sha:

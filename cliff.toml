@@ -1,4 +1,5 @@
-# git-cliff: the default config (`git cliff --init`, 2.14.2) except the [bump] block and one skip rule.
+# git-cliff: the default config (`git cliff --init`, 2.14.2) except the [bump] block, the body's trailing blank line
+# (so --prepend leaves one before the previous section) and the merge-commit preprocessor.
 # Which commits cut a release at all is decided by the Gate step of release.yml (feat, fix, perf or breaking),
 # not here: git-cliff alone bumps the patch for any conventional commit.
 # On 0.x a breaking change bumps the minor and anything else the patch (CONTRIBUTING.md#releases).
@@ -33,6 +34,7 @@ body = """
             {{ commit.message | upper_first }}\
     {% endfor %}
 {% endfor %}
+
 """
 trim = true
 render_always = true
@@ -43,7 +45,10 @@ conventional_commits = true
 filter_unconventional = true
 require_conventional = false
 split_commits = false
-commit_preprocessors = []
+commit_preprocessors = [
+    # A merge commit is not conventional and fails parsing before commit_parsers run: rewrite it into the skipped chore(pr).
+    { pattern = '^Merge (pull request|branch|remote-tracking branch)[^\n]*', replace = "chore(pr): merge" },
+]
 protect_breaking_commits = false
 commit_parsers = [
     { message = "^feat", group = "<!-- 0 -->🚀 Features" },
