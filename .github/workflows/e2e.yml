@@ -39,7 +39,15 @@ jobs:
           persist-credentials: false
       # rust-toolchain.toml pins the channel and components; rustup installs them on first use.
       - run: rustup show active-toolchain
+      # Caches saved on a PR branch are visible only to that branch; ones saved on the default branch are
+      # visible to every branch. This workflow does not run on main, so a main-only save would stay cold.
+      # rust-cache already saves only when the exact key (Cargo.lock, toolchain) missed, so each PR branch
+      # pays the ~2 min save once and its later pushes restore for free. cache-on-failure saves that first
+      # run even when a suite fails, so the fix push is not cold again. A new branch starts from main's
+      # cache if one exists: run `gh workflow run e2e.yml --ref main` after Cargo.lock changes to warm it.
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          cache-on-failure: true
       # Also builds the examples the suites and the probe launch (testwin, session_probe).
       - run: cargo build --all-targets
       - run: cargo test --example session_probe
@@ -62,6 +70,7 @@ jobs:
               ("mcp-cli", ["cargo", "test", "--test", "mcp", "--test", "cli", "--", "--ignored", "--test-threads=1"]),
               ("pipe", ["cargo", "test", "--lib", "ipc::pipe", "--", "--ignored", "--test-threads=1"]),
           ]
+          RELEASE_ENV = {"CARGO_PROFILE_RELEASE_LTO": "false", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16"}
           RESULT = re.compile(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed")
           ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -175,9 +184,14 @@ jobs:
                       suite(name, run, cmd)
                       check_hygiene(f"{name} run {run}")
 
-              built, _ = suite("release-build", 1, ["cargo", "build", "--release", "--examples"], tests=False)
+              # One compile serves both: `--no-run` builds the mcp test and the examples it launches, the
+              # second command only runs. Same env on both or cargo would rebuild. LTO off and 16 codegen
+              # units only speed up the build; debug_assertions stays off and the exes stay GUI-subsystem.
+              built, _ = suite("release-build", 1, ["cargo", "test", "--release", "--test", "mcp", "--examples", "--no-run"],
+                               env=RELEASE_ENV, tests=False)
               if built:
-                  suite("release-mcp", 1, ["cargo", "test", "--release", "--test", "mcp", "--", "--ignored", "--test-threads=1"])
+                  suite("release-mcp", 1, ["cargo", "test", "--release", "--test", "mcp", "--", "--ignored", "--test-threads=1"],
+                        env=RELEASE_ENV)
                   check_hygiene("release-mcp run 1")
 
           def cell(value):
