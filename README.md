@@ -91,7 +91,7 @@ Panel views:
 - **Windows**: lists the open windows with their managed state (and the island or "fights back" flag), with search, "Managed only" and "Show all" filters, and "Restore all".
 - **Islands**: shows the monitors and their islands to scale, with the window that occupies each one.
 - **Island editor**: creates and edits layouts and islands by dragging, snapping or typing values. The built-in preset is read-only: "Duplicate to edit" makes an editable copy.
-- **Profiles**: edits the per-game profiles (island, game resolution, delay, enabled).
+- **Profiles**: edits the per-game profiles (island, game resolution, delay, enabled). If the profile changes outside the panel while you edit it, your typed values are kept: fields you did not touch take the saved version, and a field changed on both sides shows the outside value until you choose (an island and the offsets or monitor, or width and height, count as one field when they clash). Choose "Keep mine and overwrite" to save your value with the new revision, or "Use the outside values" to replace only the marked fields. Cancel discards everything.
 - **Diagnostics**: applies a profile to a window and measures how the game reverts the style and the size, with a verdict and recommendations.
 
 Language: the panel has a language selector (System, English, Spanish). The choice is stored in `settings.json`. The language is picked in this order: the `BORDERLESS_SHATTER_LANG` environment variable (`en` or `es`), then `settings.json`, then the Windows display language (Spanish if it is Spanish, English otherwise). The tray menu picks the new language the next time the program starts. MCP tool descriptions and the engine's error messages are always English.
