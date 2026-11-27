@@ -16,7 +16,7 @@ Short map; module roles, the event loop, the IPC protocol, data files and invari
 
 - Entry: `main.rs` (dispatch by subcommand: none = resident, `gui`, `mcp`, anything else = CLI) and `tray.rs` (the resident's loop).
 - Core: `engine.rs` (owns managed-window state), `window_state.rs`, `islands.rs`, `guard.rs`, `diagnose.rs`, `watcher.rs`, `win32/`.
-- Persistence: `profiles.rs` (profiles.json v2), `settings.rs` (settings.json: language), `state_store.rs` (state.json).
+- Persistence: `profiles.rs` (profiles.json v2), `settings.rs` (settings.json: language), `autostart.rs` (HKCU Run entry for start at sign-in; the registry is its only store), `state_store.rs` (state.json).
 - Clients of the pipe: `ipc/` (protocol, server, client), `gui/` (GPUI panel), `mcp.rs` (stdio MCP server), `cli.rs` (subcommands).
 - Text: `i18n.rs` and `locales/<lang>/*.json` (catalogs).
 - Tests: `tests/` (`cli`, `mcp`, `i18n`, `properties`, `e2e`) and `examples/testwin.rs`.
@@ -50,7 +50,7 @@ borderless-shatter.exe list-windows        # CLI; see `borderless-shatter help` 
 ## Code Conventions & Common Patterns
 
 - **Errors**: `Win32Error` (thiserror, `win32/`) and `ProfileError` (`profiles.rs`) are typed. `anyhow` appears only in `gui/mod.rs`, `mcp.rs` and `tray.rs`. Non-test code has no `unwrap`/`expect`; tests may unwrap.
-- **Unsafe**: confined to Win32 calls and FFI callbacks (`win32/`, `watcher.rs`, `ipc/pipe.rs`, `diagnose.rs`, `engine.rs`, `tray.rs`, `gui/`, `cli.rs`, `mcp.rs`, `i18n.rs`). Each unsafe site carries a `// SAFETY:` comment. FFI callbacks only filter, collect or post; they do no other work.
+- **Unsafe**: confined to Win32 calls and FFI callbacks (`win32/`, `autostart.rs`, `watcher.rs`, `ipc/pipe.rs`, `diagnose.rs`, `engine.rs`, `tray.rs`, `gui/`, `cli.rs`, `mcp.rs`, `i18n.rs`). Each unsafe site carries a `// SAFETY:` comment. FFI callbacks only filter, collect or post; they do no other work.
 - **Handles**: `HWND` crosses module and state boundaries as `isize` via `win32::hwnd_to_isize` / `hwnd_from_isize`. Kernel handles we own (the single-instance mutex, process handles) are wrapped in `OwnedHandle`, which calls `CloseHandle` on drop.
 - **Pure logic**: style masks, rect math and profile parsing/matching live in `window_state.rs` and `profiles.rs`, which import no `windows` types. Their unit tests sit in `#[cfg(test)]` modules in the same files.
 - **Event handling**: the resident's message-loop thread never calls `thread::sleep`. Delayed work is armed with `SetTimer` on the message-only window (`win32::set_timer`) and killed on its first `WM_TIMER`. The wndproc only queues events (plus killing that timer); the main loop drains the queue after each dispatch.

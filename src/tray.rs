@@ -4,12 +4,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
 use tokio::sync::oneshot;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
 };
 
+use crate::autostart::{self, Autostart};
 use crate::engine::{self, Engine, IpcItem, WM_SHATTER_IPC};
 use crate::i18n::{t, tf};
 use crate::ipc::Request;
@@ -27,12 +30,37 @@ pub enum TrayCommand {
     Reload,
     /// Launch `borderless-shatter gui` (the panel enforces its own single instance).
     OpenPanel,
+    /// Turn "Start at sign-in" on (or off, when it is on).
+    ToggleAutostart,
     Quit,
 }
 
 pub struct Tray {
     icon: TrayIcon,
     commands: HashMap<MenuId, TrayCommand>,
+    /// The menu's autostart check, refreshed from the registry before the menu opens.
+    autostart_item: CheckMenuItem,
+}
+
+/// The right-button press arrives as its own event, before the release that opens the menu.
+fn is_right_press(event: &TrayIconEvent) -> bool {
+    matches!(
+        event,
+        TrayIconEvent::Click {
+            button: MouseButton::Right,
+            button_state: MouseButtonState::Down,
+            ..
+        }
+    )
+}
+
+/// Flips the registry entry: on becomes off; off, another copy or disabled by Windows becomes on.
+fn toggle_autostart() -> Result<(), win32::Win32Error> {
+    if autostart::status()? == Autostart::On {
+        autostart::disable()
+    } else {
+        autostart::enable()
+    }
 }
 
 const TOOLTIP: &str = "Borderless Shatter";
@@ -57,10 +85,9 @@ fn make_icon() -> anyhow::Result<Icon> {
     Ok(Icon::from_rgba(rgba, N, N)?)
 }
 
-fn build_menu(
-    profiles: &ProfileFile,
-    layouts: &[Layout],
-) -> anyhow::Result<(Menu, HashMap<MenuId, TrayCommand>)> {
+type BuiltMenu = (Menu, HashMap<MenuId, TrayCommand>, CheckMenuItem);
+
+fn build_menu(profiles: &ProfileFile, layouts: &[Layout]) -> anyhow::Result<BuiltMenu> {
     let menu = Menu::new();
     let mut commands = HashMap::new();
     let panel = MenuItem::new(t("tray.open_panel"), true, None);
@@ -94,30 +121,44 @@ fn build_menu(
         commands.insert(item.id().clone(), cmd);
     }
     menu.append(&PredefinedMenuItem::separator())?;
+    let start = CheckMenuItem::new(
+        t("tray.autostart"),
+        true,
+        autostart::status().is_ok_and(|s| s == Autostart::On),
+        None,
+    );
+    menu.append(&start)?;
+    commands.insert(start.id().clone(), TrayCommand::ToggleAutostart);
+    menu.append(&PredefinedMenuItem::separator())?;
     let quit = MenuItem::new(t("tray.quit"), true, None);
     menu.append(&quit)?;
     commands.insert(quit.id().clone(), TrayCommand::Quit);
-    Ok((menu, commands))
+    Ok((menu, commands, start))
 }
 
 impl Tray {
     /// Must be called on the thread that runs the Win32 message loop: the tray
     /// icon's hidden window and its events are bound to the creating thread.
     pub fn new(profiles: &ProfileFile, layouts: &[Layout]) -> anyhow::Result<Tray> {
-        let (menu, commands) = build_menu(profiles, layouts)?;
+        let (menu, commands, autostart_item) = build_menu(profiles, layouts)?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .with_tooltip(TOOLTIP)
             .with_icon(make_icon()?)
             .build()?;
-        Ok(Tray { icon, commands })
+        Ok(Tray {
+            icon,
+            commands,
+            autostart_item,
+        })
     }
 
     pub fn set_menu(&mut self, profiles: &ProfileFile, layouts: &[Layout]) -> anyhow::Result<()> {
-        let (menu, commands) = build_menu(profiles, layouts)?;
+        let (menu, commands, autostart_item) = build_menu(profiles, layouts)?;
         self.icon.set_menu(Some(Box::new(menu)));
         self.commands = commands;
+        self.autostart_item = autostart_item;
         Ok(())
     }
 
@@ -149,6 +190,11 @@ impl Tray {
                 continue;
             }
             let event = TrayIconEvent::receiver().try_recv().ok()?;
+            if is_right_press(&event) {
+                // The panel may have changed the registry since the menu was built.
+                let on = autostart::status().is_ok_and(|s| s == Autostart::On);
+                self.autostart_item.set_checked(on);
+            }
             if let Some(cmd) = command_for_event(&event) {
                 return Some(cmd);
             }
@@ -167,7 +213,7 @@ fn command_for_event(event: &TrayIconEvent) -> Option<TrayCommand> {
     }
 }
 
-fn drain_tray(tray: &Tray, engine: &mut Engine) {
+fn drain_tray(tray: &mut Tray, engine: &mut Engine) {
     while let Some(cmd) = tray.poll() {
         match cmd {
             TrayCommand::Apply(process) => engine.apply_process(&process),
@@ -177,6 +223,12 @@ fn drain_tray(tray: &Tray, engine: &mut Engine) {
             TrayCommand::OpenPanel => {
                 if let Err(e) = crate::gui::spawn_detached(&["gui"]) {
                     eprintln!("could not open the panel: {e}");
+                }
+            }
+            TrayCommand::ToggleAutostart => {
+                if let Err(e) = toggle_autostart() {
+                    eprintln!("autostart: {e}");
+                    tray.set_status(&tf("tray.status.autostart_error", &[("error", &e)]));
                 }
             }
             // SAFETY: plain Win32 call, always valid on a thread with a message queue.
@@ -250,7 +302,7 @@ pub fn run() -> anyhow::Result<()> {
             eprintln!("ipc: pipe stopped: {m}");
             tray.set_status(&tf("tray.status.pipe_stopped", &[("error", &m)]));
         }
-        drain_tray(&tray, &mut engine);
+        drain_tray(&mut tray, &mut engine);
         if engine.take_menu_dirty()
             && let Err(e) = tray.set_menu(engine.profiles(), &engine.layouts())
         {
@@ -281,6 +333,7 @@ mod tests {
             .iter()
             .filter_map(|i| match i {
                 MenuItemKind::MenuItem(m) => Some(m.text()),
+                MenuItemKind::Check(c) => Some(c.text()),
                 MenuItemKind::Submenu(s) => Some(s.text()),
                 _ => None,
             })
@@ -294,7 +347,7 @@ mod tests {
         }))
         .unwrap();
         let _g = scoped_locale(Locale::En);
-        let (menu, commands) = build_menu(&profiles, &crate::islands::presets()).unwrap();
+        let (menu, commands, _) = build_menu(&profiles, &crate::islands::presets()).unwrap();
         assert_eq!(
             labels(&menu),
             [
@@ -303,13 +356,19 @@ mod tests {
                 "Place active window in island",
                 "Restore all",
                 "Reload profiles",
+                "Start at sign-in",
                 "Quit"
             ]
         );
         assert!(commands.values().any(|c| *c == TrayCommand::Quit));
+        assert!(
+            commands
+                .values()
+                .any(|c| *c == TrayCommand::ToggleAutostart)
+        );
         drop(_g);
         let _g = scoped_locale(Locale::Es);
-        let (menu, _) = build_menu(&profiles, &[]).unwrap();
+        let (menu, _, _) = build_menu(&profiles, &[]).unwrap();
         let es = labels(&menu);
         assert_eq!(es[0], crate::i18n::t("tray.open_panel"));
         assert_ne!(es[0], "Open panel");
@@ -330,6 +389,29 @@ mod tests {
             rect: rect(),
             button,
         }
+    }
+
+    #[test]
+    fn only_a_right_button_press_refreshes_the_check() {
+        let click = |button, button_state| TrayIconEvent::Click {
+            id: TrayIconId::new("test"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: rect(),
+            button,
+            button_state,
+        };
+        assert!(is_right_press(&click(
+            MouseButton::Right,
+            MouseButtonState::Down
+        )));
+        assert!(!is_right_press(&click(
+            MouseButton::Right,
+            MouseButtonState::Up
+        )));
+        assert!(!is_right_press(&click(
+            MouseButton::Left,
+            MouseButtonState::Down
+        )));
     }
 
     #[test]

@@ -7,5 +7,7 @@
   "tray.quit": "Salir",
   "tray.status.no_pipe": "sin tubería IPC: {error}",
   "tray.status.pipe_stopped": "Tubería IPC detenida: {error}",
-  "tray.status.menu_error": "menú: {error}"
+  "tray.status.menu_error": "menú: {error}",
+  "tray.autostart": "Iniciar al abrir sesión",
+  "tray.status.autostart_error": "inicio al abrir sesión: {error}"
 }

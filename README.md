@@ -96,6 +96,8 @@ Panel views:
 
 Language: the panel has a language selector (System, English, Spanish). The choice is stored in `settings.json`. The language is picked in this order: the `BORDERLESS_SHATTER_LANG` environment variable (`en` or `es`), then `settings.json`, then the Windows display language (Spanish if it is Spanish, English otherwise). The tray menu picks the new language the next time the program starts. MCP tool descriptions and the engine's error messages are always English.
 
+Start at sign-in: a "Start at sign-in" switch in the panel (next to the language selector) and a checkable item in the tray menu start the tray at Windows sign-in. It is off by default, needs no administrator rights, and writes one per-user entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` only when you turn it on; turning it off removes it. The registry is the only record (nothing is stored in `settings.json`), so the panel and the tray always show what Windows has. If the entry points to another copy of the program, the panel says which one; turning it on again makes it start this copy. If you disabled it in Task Manager's Startup tab, the panel says so; turning it on here re-enables it. An instance started with `BORDERLESS_SHATTER_INSTANCE` uses its own entry name.
+
 ## Profiles
 
 File: `%APPDATA%\BorderlessShatter\profiles.json`. If it does not exist, it is created empty at startup. The format version is `2`; a higher version is rejected and the file is left untouched. A version `1` file is read as is and migrated on the next save; the original is first copied once to `profiles.v1.bak`. Every save also keeps the replaced file as `profiles.json.prev`. An invalid file is reported and never overwritten.
