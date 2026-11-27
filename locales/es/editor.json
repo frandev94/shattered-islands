@@ -20,7 +20,7 @@
   "editor.gate.busy": "Espera a que termine la operación en curso",
   "editor.gate.errors": "Corrige los errores de «Incidencias» para poder guardar",
   "editor.gate.clean": "No hay cambios que guardar",
-  "editor.problem.profile_error": "El fichero de perfiles no se puede leer: puede estar dañado o no ser JSON válido. Corrígelo a mano; mientras tanto el editor es de solo lectura y no lo sobrescribe.",
+  "editor.problem.profile_error": "El fichero de perfiles no se puede leer: está dañado, no es JSON válido, repite una clave o usa un array donde se espera un objeto. Corrígelo a mano; mientras tanto el editor es de solo lectura y no lo sobrescribe.",
   "editor.problem.unsupported_version": "El fichero de perfiles es de una versión más nueva de Borderless Shatter. Actualiza la aplicación para editarlo; mientras tanto el editor es de solo lectura.",
   "editor.problem.transport": "No se puede conectar con Borderless Shatter. Inícialo con «Iniciar» en la barra lateral o desde el icono de la bandeja y vuelve a intentarlo.",
   "editor.ph.layout_id": "mi-diseño",

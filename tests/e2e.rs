@@ -473,10 +473,33 @@ fn invalid_profiles_json_is_never_overwritten() {
     let v99 = r#"{"version":99,"profiles":[]}"#;
     h.write_profiles(v99);
     assert_eq!(
-        call_err(&mut c, "set_profiles", fake).code,
+        call_err(&mut c, "set_profiles", fake.clone()).code,
         ErrorCode::UnsupportedVersion
     );
     assert_eq!(fs::read(&path).expect("read"), v99.as_bytes());
+
+    // Valid JSON the strict load rejects: a repeated key (also in a v1 file) or a positional array.
+    let dir = path.parent().expect("parent");
+    for text in [
+        r#"{"version":2,"profiles":[{"process":"a.exe","_note":"a","_note":"b"}]}"#,
+        r#"{"version":2,"profiles":[{"process":"a.exe","offsets":[8,0,8,0]}]}"#,
+        r#"{"version":1,"profiles":[{"process":"a.exe","_n":1,"_n":2}]}"#,
+    ] {
+        h.write_profiles(text);
+        assert_eq!(
+            call_err(&mut c, "get_profiles", json!({})).code,
+            ErrorCode::ProfileError,
+            "{text}"
+        );
+        assert_eq!(
+            call_err(&mut c, "set_profiles", fake.clone()).code,
+            ErrorCode::ProfileError,
+            "{text}"
+        );
+        assert_eq!(fs::read(&path).expect("read"), text.as_bytes());
+        assert!(!dir.join("profiles.json.prev").exists(), "{text}");
+        assert!(!dir.join("profiles.v1.bak").exists(), "{text}");
+    }
 }
 
 /// Creates real windows (resident + 2 testwin); see module docs.

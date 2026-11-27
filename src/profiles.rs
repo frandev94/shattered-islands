@@ -2,7 +2,8 @@
 //!
 //! Offsets and sizes are physical pixels; island fractions are `0..1` with at most 6 decimals.
 //! Unknown JSON fields of the file and of each profile, layout and island are kept (`extra`); see
-//! [`upsert`] for how a replace carries them over. A file newer than [`SUPPORTED_VERSION`] is rejected.
+//! [`upsert`] for how a replace carries them over. A file newer than [`SUPPORTED_VERSION`] is rejected;
+//! a key repeated in any object or an array where an object is expected is [`ProfileError::Parse`].
 //! [`Warning::code`] values and `ErrorBody` codes are the stable contract, not message texts.
 //!
 //! ```
@@ -191,18 +192,25 @@ pub fn default_path() -> Result<PathBuf, ProfileError> {
         .join("profiles.json"))
 }
 
-/// Parses profile JSON, rejecting versions above [`SUPPORTED_VERSION`].
+/// Parses profile JSON, rejecting versions above [`SUPPORTED_VERSION`]. A key repeated in any object
+/// or an array where an object is expected is [`ProfileError::Parse`]; a newer version wins over both.
 ///
 /// ```
 /// use borderless_shatter::profiles::{parse, ProfileError};
 ///
 /// assert!(matches!(parse(r#"{"version":99}"#), Err(ProfileError::UnsupportedVersion(99))));
+/// assert!(matches!(parse(r#"{"version":2,"_a":1,"_a":2}"#), Err(ProfileError::Parse(_))));
 /// ```
 pub fn parse(s: &str) -> Result<ProfileFile, ProfileError> {
     let file: ProfileFile = serde_json::from_str(s)?;
     if file.version > SUPPORTED_VERSION {
         return Err(ProfileError::UnsupportedVersion(file.version));
     }
+    // Same rule as IPC: serde keeps the last repeated unknown key and reads structs by position.
+    crate::ipc::check_unique_keys(s.as_bytes())?;
+    let value: serde_json::Value = serde_json::from_str(s)?;
+    crate::ipc::check_arrays::<ProfileFile>(&value)
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
     Ok(file)
 }
 
@@ -497,8 +505,10 @@ fn text_of(bytes: &[u8]) -> Result<&str, ProfileError> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
 }
 
-/// Loads the file and its revision; a missing file is created empty (v2). Invalid files are never
-/// touched. A UTF-8 byte order mark is accepted; UTF-16 gives [`ProfileError::Utf16`].
+/// Loads the file and its revision; a missing file is created empty (v2). Invalid files (see
+/// [`parse`]: a key repeated in any object or an array where an object is expected is
+/// [`ProfileError::Parse`]) are never touched. A UTF-8 byte order mark is accepted; UTF-16 gives
+/// [`ProfileError::Utf16`].
 pub fn load(path: &Path) -> Result<(ProfileFile, String), ProfileError> {
     if !path.exists() {
         let file = ProfileFile {
@@ -1129,6 +1139,149 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             assert!(matches!(load(&path), Err(ProfileError::Utf16)));
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `parse(text)` is `Parse` and its message contains `needle`.
+    fn rejected(text: &str, needle: &str) {
+        match parse(text) {
+            Err(ProfileError::Parse(e)) => assert!(e.to_string().contains(needle), "{text}: {e}"),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_make_the_file_invalid() {
+        let island = |rect: &str, island: &str| {
+            format!(
+                r#"{{"version":2,"layouts":[{{"id":"l","monitor":0,"islands":[{{"id":"i",
+                  "rect":{{"x":0,"y":0,"w":1,"h":1{rect}}}{island}}}]}}]}}"#
+            )
+        };
+        for text in [
+            r#"{"version":2,"_a":1,"_a":2}"#.to_string(),
+            r#"{"version":2,"profiles":[{"process":"a","_n":1,"_n":2}]}"#.into(),
+            r#"{"version":2,"layouts":[{"id":"l","monitor":0,"islands":[],"_l":1,"_l":2}]}"#.into(),
+            island("", r#","_i":1,"_i":2"#),
+            island(r#","_r":1,"_r":2"#, ""),
+            r#"{"version":2,"_x":{"k":1,"k":2}}"#.into(),
+            r#"{"version":2,"_x":[{"k":[{"j":1,"j":2}]}]}"#.into(),
+            r#"{"version":2,"profiles":[{"process":"a","offsets":{"left":1,"_z":0,"_z":0}}]}"#
+                .into(),
+            r#"{"version":2,"profiles":[{"process":"a",
+              "game_resolution":{"width":1,"height":1,"_z":0,"_z":0}}]}"#
+                .into(),
+            r#"{"version":2,"_a":1,"\u005fa":2}"#.into(),
+            r#"{"version":2,"profiles":[{"process":"a","enabled":true,"enabled":false}]}"#.into(),
+        ] {
+            rejected(&text, "duplicate");
+        }
+    }
+
+    #[test]
+    fn arrays_where_objects_are_expected_make_the_file_invalid() {
+        for (text, at) in [
+            (
+                r#"{"version":2,"profiles":[{"process":"a","offsets":[1,2,3,4]}]}"#,
+                "/profiles/0/offsets",
+            ),
+            (
+                r#"{"version":2,"profiles":[{"process":"a","game_resolution":[1920,1080]}]}"#,
+                "/profiles/0/game_resolution",
+            ),
+            (
+                r#"{"version":2,"layouts":[{"id":"l","monitor":0,"islands":[
+                  {"id":"i","rect":[0,0,0.5,1]}]}]}"#,
+                "/layouts/0/islands/0/rect",
+            ),
+        ] {
+            rejected(text, &format!("unexpected array at \"{at}\""));
+        }
+    }
+
+    #[test]
+    fn strict_checks_keep_valid_files_loading() {
+        // Arrays, objects and the same key in different objects, in the extras of all four levels.
+        let text = r#"{"version":2,"_t":[1,{"k":[2]}],"layouts":[{"id":"l","monitor":0,
+          "_l":{"k":[1,2]},"islands":[{"id":"i","_i":[[1],{"k":{}}],
+          "rect":{"x":0,"y":0,"w":1,"h":1}}]}],"profiles":[{"process":"a","_p":{"k":[{"k":1}]}}]}"#;
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(crate::ipc::check_arrays::<ProfileFile>(&value), Ok(()));
+        let dir = tmp_dir("strict-extras");
+        let path = dir.join("profiles.json");
+        std::fs::write(&path, text).unwrap();
+        let (f, _) = load(&path).unwrap();
+        save_atomic(&path, &f).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for at in [
+            "/_t",
+            "/layouts/0/_l",
+            "/layouts/0/islands/0/_i",
+            "/profiles/0/_p",
+        ] {
+            assert_eq!(saved.pointer(at), value.pointer(at), "{at}");
+        }
+        assert_eq!(load(&path).unwrap().0, f);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let two = parse(
+            r#"{"version":2,"layouts":[{"id":"l","monitor":0,"islands":[]},
+              {"id":"l","monitor":1,"islands":[]}]}"#,
+        )
+        .unwrap();
+        assert!(validate(&two).iter().any(|w| w.code == "duplicate_layout"));
+        let same_key =
+            parse(r#"{"version":2,"profiles":[{"process":"a","_n":1},{"process":"b","_n":2}]}"#)
+                .unwrap();
+        assert_eq!(same_key.profiles[1].extra["_n"], 2);
+        assert_eq!(parse(FULL).unwrap().version, 1);
+    }
+
+    #[test]
+    fn newer_version_wins_over_shape_errors() {
+        for text in [
+            r#"{"version":99,"_a":1,"_a":2}"#,
+            r#"{"version":3,"profiles":[{"process":"a","offsets":[1,2,3,4]}]}"#,
+        ] {
+            assert!(
+                matches!(parse(text), Err(ProfileError::UnsupportedVersion(_))),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_v1_with_a_duplicate_key_is_kept_and_not_backed_up() {
+        let dir = tmp_dir("v1-dup");
+        let path = dir.join("profiles.json");
+        let bak = dir.join("profiles.v1.bak");
+        let prev = dir.join("profiles.json.prev");
+        let dup = FULL.replacen(r#""process""#, r#""_n":1,"_n":2,"process""#, 1);
+        std::fs::write(&path, &dup).unwrap();
+        assert!(matches!(load(&path), Err(ProfileError::Parse(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), dup.as_bytes());
+        assert!(!bak.exists() && !prev.exists());
+
+        std::fs::write(&path, FULL).unwrap();
+        let (f, _) = load(&path).unwrap();
+        save_atomic(&path, &f).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), FULL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignored_values_are_still_parsed_strictly_and_file_is_kept() {
+        let dir = tmp_dir("strict-ignored");
+        let path = dir.join("profiles.json");
+        for bad in [r#"1e999"#, r#""\ud800""#] {
+            let text = format!(
+                r#"{{"version":2,"profiles":[{{"process":"a","offsets":{{"_x":{bad}}}}}]}}"#
+            );
+            std::fs::write(&path, &text).unwrap();
+            assert!(matches!(load(&path), Err(ProfileError::Parse(_))), "{bad}");
+            assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes(), "{bad}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

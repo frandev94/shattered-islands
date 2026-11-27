@@ -135,12 +135,16 @@ fn arb_island_rect_any() -> impl Strategy<Value = IslandRect> {
 }
 
 /// Unknown fields: no known field at any level starts with `_`; no floats (see the file header).
+/// Arrays and objects too: the strict load must not reject them inside an unknown field.
 fn arb_extra() -> impl Strategy<Value = serde_json::Map<String, Value>> {
     let value = prop_oneof![
         Just(Value::Null),
         any::<bool>().prop_map(Value::from),
         any::<i64>().prop_map(Value::from),
         any::<String>().prop_map(Value::from),
+        vec(any::<i64>(), 0..3).prop_map(Value::from),
+        proptest::collection::btree_map("[a-z]{1,3}", any::<i64>(), 0..3)
+            .prop_map(|m| Value::Object(m.into_iter().map(|(k, v)| (k, v.into())).collect())),
     ];
     proptest::collection::btree_map("_[a-z0-9]{1,6}", value, 0..3)
         .prop_map(|m| m.into_iter().collect())
@@ -768,6 +772,12 @@ proptest! {
     }
 
     #[test]
+    fn duplicate_top_level_key_is_rejected(file in arb_file()) {
+        let text = serde_json::to_string(&file).unwrap().replacen('{', r#"{"_dup":0,"_dup":0,"#, 1);
+        prop_assert!(matches!(profiles::parse(&text), Err(ProfileError::Parse(_))), "{text}");
+    }
+
+    #[test]
     fn upsert_extras_carry_over_or_replace(
         mut file in arb_file(),
         mut layout in arb_layout_any(),
@@ -1105,7 +1115,7 @@ fn object_pointers(v: &Value, at: &str, out: &mut Vec<String>) {
 }
 
 /// P2: replacing one struct node of `p` by the array of its values is `invalid_params`, reported
-/// at that node. Every object in these generated params is a typed struct: extras hold scalars.
+/// at that node. Objects inside extras (keys starting with `_`) are free-form, so none is picked.
 fn positional_struct_is_rejected<T>(p: &T, pick: prop::sample::Index) -> Result<(), TestCaseError>
 where
     T: Serialize + DeserializeOwned + JsonSchema + std::fmt::Debug,
@@ -1113,6 +1123,7 @@ where
     let mut v = serde_json::to_value(p).unwrap();
     let mut pointers = Vec::new();
     object_pointers(&v, "", &mut pointers);
+    pointers.retain(|at| !at.split('/').any(|s| s.starts_with('_')));
     let at = pick.get(&pointers).clone();
     let node = v.pointer_mut(&at).unwrap();
     let values = node.as_object().unwrap().values().cloned().collect();

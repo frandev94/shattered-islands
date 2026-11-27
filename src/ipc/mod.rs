@@ -365,8 +365,8 @@ impl<'de> Visitor<'de> for UniqueKeys {
 const MAX_REF_HOPS: usize = 32;
 
 /// Rejects a JSON array wherever `T`'s published schema allows none, naming its JSON Pointer.
-fn check_arrays<T: JsonSchema>(value: &Value) -> Result<(), String> {
-    // shortcut: schema regenerated per call, cache by TypeId if parse_params becomes hot.
+pub(crate) fn check_arrays<T: JsonSchema>(value: &Value) -> Result<(), String> {
+    // shortcut: schema regenerated per call, cache by TypeId if parse_params or profiles::load becomes hot.
     let schema = SchemaGenerator::default().into_root_schema_for::<T>();
     let root = schema.as_value();
     walk_schema(root, &[root], value, &mut String::new())
@@ -1186,6 +1186,7 @@ mod tests {
         collect::<GetProfilesParams>(&mut found);
         collect::<SetProfilesParams>(&mut found);
         collect::<DiagnoseParams>(&mut found);
+        collect::<crate::profiles::ProfileFile>(&mut found);
         let unknown: Vec<&String> = found
             .iter()
             .filter(|k| !WALKED.contains(&k.as_str()) && !INERT.contains(&k.as_str()))
