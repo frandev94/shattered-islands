@@ -24,6 +24,7 @@
   "cli.error.body_too_large": "«{file}» supera el máximo de {max} bytes",
   "cli.error.body_not_object": "«{file}» debe contener un objeto JSON con los parámetros de set_profiles",
   "cli.error.body_invalid_json": "«{file}» no es JSON válido: {reason}",
+  "cli.error.body_duplicate_key": "«{file}» repite una clave más de una vez: {reason}",
   "cli.error.unknown_method": "método desconocido «{method}»",
   "cli.error.invalid_argument": "argumento con caracteres no válidos: «{arg}»",
   "cli.error.not_running": "Borderless Shatter no está en marcha: inícialo con borderless-shatter.exe",

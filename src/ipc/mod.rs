@@ -250,15 +250,18 @@ pub fn decode_request(line: &str) -> Result<Request, ErrorBody> {
     // Parse to `Value` first so syntax and depth errors are `invalid_json` whatever the shape.
     let value: Value = serde_json::from_str(line).map_err(|e| error(ErrorCode::InvalidJson, e))?;
     // `Value` keeps the last of repeated keys; RFC 8259 allows them, so they are a shape error.
-    let mut de = serde_json::Deserializer::from_str(line);
-    UniqueKeys::deserialize(&mut de)
-        .and_then(|_| de.end())
-        .map_err(|e| error(ErrorCode::InvalidParams, e))?;
+    check_unique_keys(line.as_bytes()).map_err(|e| error(ErrorCode::InvalidParams, e))?;
     // Derived struct deserialisers also accept a positional array; requests are objects only.
     if value.is_array() {
         return Err(error(ErrorCode::InvalidParams, not_an_object()));
     }
     serde_json::from_value(value).map_err(|e| error(ErrorCode::InvalidParams, e))
+}
+
+/// Fails on a key repeated in any object of the JSON document (compared after unescaping).
+pub fn check_unique_keys(bytes: &[u8]) -> Result<(), serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    UniqueKeys::deserialize(&mut de).and_then(|_| de.end())
 }
 
 /// Deserialise a method's `params` (`null`/absent is treated as `{}`; unknown fields are ignored).
