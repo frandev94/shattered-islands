@@ -432,6 +432,14 @@ impl Harness {
             .join("profiles.json")
     }
 
+    /// `%LOCALAPPDATA%\BorderlessShatter\state.<suffix>.json` of this harness' isolated resident.
+    pub fn state_path(&self) -> PathBuf {
+        self.dir
+            .join("local")
+            .join("BorderlessShatter")
+            .join(format!("state.{}.json", self.suffix))
+    }
+
     /// Writes `profiles.json` (call before [`Harness::start_resident`] to seed it).
     pub fn write_profiles(&self, text: &str) {
         let path = self.profiles_path();
