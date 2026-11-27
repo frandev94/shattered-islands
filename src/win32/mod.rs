@@ -1,5 +1,6 @@
-//! Thin wrappers over the `windows` crate for the app's Win32 calls. Only the message loop in
-//! `main.rs` and the WinEvent callback in `watcher.rs` hold a few `unsafe` sites of their own.
+//! Thin wrappers over the `windows` crate for the app's Win32 calls. Where a wrapper exists, call it
+//! instead of the raw API. Modules outside this one that hold their own `unsafe` sites are listed under
+//! Unsafe in `AGENTS.md`.
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, LPARAM, LRESULT, RECT,
