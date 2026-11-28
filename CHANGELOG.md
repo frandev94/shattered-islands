@@ -2,6 +2,17 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.8] - 2026-11-28
+
+### 🚀 Features
+
+- *(profiles)* Match windows by title or title regex
+- *(gui)* Choose a window title rule for a profile in the panel
+
+### 🧪 Testing
+
+- *(e2e)* Cover title rules, late titles and restore
+
 ## [0.2.7] - 2026-11-27
 
 ### 🚀 Features
