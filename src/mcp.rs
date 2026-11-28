@@ -17,7 +17,7 @@ use windows::Win32::System::Console::{
 };
 
 use crate::ipc::pipe::Client;
-use crate::ipc::{self, CallError, HelloResult, IpcError, PROTOCOL};
+use crate::ipc::{self, CallError, IpcError};
 
 /// How long the auto-started resident gets to open its pipe.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -194,20 +194,6 @@ fn to_tool_result(r: Result<Value, CallError>) -> CallToolResult {
     }
 }
 
-/// `hello` result → `Ok` only for our protocol revision.
-pub(crate) fn check_hello(hello: Value) -> Result<(), CallError> {
-    let hello: HelloResult = serde_json::from_value(hello).map_err(IpcError::from)?;
-    if hello.protocol == PROTOCOL {
-        Ok(())
-    } else {
-        Err(IpcError::Protocol(format!(
-            "the resident speaks protocol {} and this client {PROTOCOL}",
-            hello.protocol
-        ))
-        .into())
-    }
-}
-
 /// Production backend: one pipe connection per call (survives resident restarts).
 fn call_resident(method: &'static str, params: Value) -> Result<Forwarded, String> {
     let connected = match Client::connect(CONNECT_TIMEOUT) {
@@ -226,7 +212,7 @@ fn call_resident(method: &'static str, params: Value) -> Result<Forwarded, Strin
     };
     let result = client
         .call("hello", Value::Object(Map::new()))
-        .and_then(check_hello)
+        .and_then(ipc::check_hello)
         .and_then(|()| client.call(method, params));
     Ok(Forwarded {
         result,
@@ -299,6 +285,7 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::ipc::{ErrorBody, ErrorCode};
+    use crate::ipc::{PROTOCOL, check_hello};
     use rmcp::handler::server::common::schema_for_input;
     use serde_json::json;
     use std::sync::Mutex;

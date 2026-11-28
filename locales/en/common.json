@@ -18,5 +18,6 @@
   "common.error.busy": "Borderless Shatter is busy with another action. Try again.",
   "common.error.internal": "Borderless Shatter hit an internal error.",
   "common.error.resident_unreachable": "Borderless Shatter is not running. Press \"Start\" in the sidebar.",
-  "common.error.transport_error": "The connection to Borderless Shatter was lost. Try again."
+  "common.error.transport_error": "The connection to Borderless Shatter was lost. Try again.",
+  "common.error.protocol_mismatch": "The running Borderless Shatter is a different version (protocol {protocol}). Restart it and try again."
 }

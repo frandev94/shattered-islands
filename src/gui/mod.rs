@@ -139,6 +139,13 @@ pub enum Load<T> {
     Error(String),
 }
 
+/// A client already past the `hello` check: a mismatched resident never receives a request.
+pub(crate) fn connect_checked() -> Result<Client, Failure> {
+    let mut c = Client::connect(Duration::from_millis(500)).map_err(|_| Failure::Down)?;
+    handshake(&mut c)?;
+    Ok(c)
+}
+
 /// Run `f` with a connected IPC client on a background thread (never the UI thread).
 pub async fn ipc_call<T: Send + 'static>(
     cx: &mut AsyncApp,
@@ -150,11 +157,24 @@ pub async fn ipc_call<T: Send + 'static>(
     }
     cx.background_executor()
         .spawn(async move {
-            let mut c = Client::connect(Duration::from_millis(500))
-                .map_err(|_| i18n::t("common.error.resident_unreachable").into_owned())?;
+            let mut c = connect_checked().map_err(|f| failure_text(&f).0)?;
             f(&mut c).map_err(|e| call_error_text(&e))
         })
         .await
+}
+
+/// `hello` answer → `Ok` only for our protocol revision (same comparison as the CLI and MCP).
+fn judge(hello: Result<Value, CallError>) -> Result<(), Failure> {
+    let hello = hello.map_err(|_| Failure::Transport)?;
+    match crate::ipc::protocol_mismatch(&hello).map_err(|_| Failure::Transport)? {
+        None => Ok(()),
+        Some(n) => Err(Failure::Protocol(n)),
+    }
+}
+
+/// One `hello` on a fresh connection, before any request: a mismatched resident gets nothing else.
+fn handshake(c: &mut Client) -> Result<(), Failure> {
+    judge(c.call("hello", json!({})))
 }
 
 /// Plain sentence for a failed call: the engine code picks it, raw transport text never shows.
@@ -175,7 +195,7 @@ pub async fn call<T: Send + 'static>(
     }
     cx.background_executor()
         .spawn(async move {
-            let mut c = Client::connect(Duration::from_millis(500)).map_err(|_| Failure::Down)?;
+            let mut c = connect_checked()?;
             match f(&mut c) {
                 Ok(Reply::Ok(v)) => Ok(v),
                 Ok(Reply::Remote(b)) => Err(Failure::Engine(b.code)),
@@ -218,6 +238,8 @@ pub enum Failure {
     Down,
     Transport,
     Engine(ErrorCode),
+    /// The resident answers `hello` with another protocol revision; nothing was sent to it.
+    Protocol(u32),
 }
 
 /// Plain sentence plus the small stable `code`; never raw OS or transport text.
@@ -230,6 +252,10 @@ pub fn failure_text(f: &Failure) -> (String, String) {
         Failure::Transport => (
             i18n::t("common.error.transport_error").into_owned(),
             "transport_error".to_owned(),
+        ),
+        Failure::Protocol(n) => (
+            i18n::tf("common.error.protocol_mismatch", &[("protocol", n)]),
+            "protocol_mismatch".to_owned(),
         ),
         Failure::Engine(c) => (i18n::error_sentence(*c).into_owned(), code_str(*c)),
     }
@@ -401,19 +427,67 @@ impl Section {
 /// How long a probe waits for the pipe: a busy resident must not read as "not running".
 const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Is the resident process answering?
-fn probe() -> bool {
-    Client::connect(PROBE_TIMEOUT).is_ok_and(|mut c| c.call("hello", json!({})).is_ok())
+/// What a probe found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    Up,
+    Down,
+    /// Answers, but speaks another protocol revision.
+    WrongProtocol(u32),
 }
 
-/// Debounce: a connected panel needs two failed probes in a row before it says "down" (one
-/// slow answer must not flicker the sidebar). Returns the connection to show and the new count.
-fn settle(connected: Option<bool>, misses: u8, up: bool) -> (bool, u8) {
-    if up {
-        return (true, 0);
+fn probe_of(hello: Result<Value, CallError>) -> Probe {
+    match judge(hello) {
+        Ok(()) => Probe::Up,
+        Err(Failure::Protocol(n)) => Probe::WrongProtocol(n),
+        Err(_) => Probe::Down,
     }
-    let misses = misses.saturating_add(1);
-    (connected == Some(true) && misses < 2, misses)
+}
+
+/// Is the resident process answering, with our protocol?
+fn probe() -> Probe {
+    Client::connect(PROBE_TIMEOUT).map_or(Probe::Down, |mut c| probe_of(c.call("hello", json!({}))))
+}
+
+/// What the panel believes about the resident.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Link {
+    /// `None` until the first probe answers.
+    connected: Option<bool>,
+    /// Consecutive failed probes.
+    misses: u8,
+    /// Protocol revision of a resident that answers with another one.
+    mismatch: Option<u32>,
+}
+
+/// The one transition for a probe result. An answer (`Up`, `WrongProtocol`) settles at once; a
+/// failed probe is debounced: one slow answer keeps the verdict, two in a row mean down and
+/// forget a stale mismatch, so the Start button comes back. The first probe is taken as is.
+fn next_link(prev: Link, probe: Probe) -> Link {
+    match probe {
+        Probe::Up => Link {
+            connected: Some(true),
+            misses: 0,
+            mismatch: None,
+        },
+        Probe::WrongProtocol(n) => Link {
+            connected: Some(false),
+            misses: 0,
+            mismatch: Some(n),
+        },
+        Probe::Down => {
+            let misses = prev.misses.saturating_add(1);
+            if prev.connected.is_none() || misses >= 2 {
+                Link {
+                    connected: Some(false),
+                    misses,
+                    mismatch: None,
+                }
+            } else {
+                Link { misses, ..prev }
+            }
+        }
+    }
 }
 
 /// What the sidebar status shows (dot colour and label).
@@ -424,13 +498,21 @@ enum Status {
     Up,
     Down,
     Checking,
+    /// The resident answers with another protocol revision.
+    WrongProtocol(u32),
 }
 
 impl Status {
-    fn of(connected: Option<bool>, starting: bool, start_failed: bool) -> Self {
-        match (connected, starting, start_failed) {
-            (_, true, _) => Status::Starting,
-            (_, _, true) => Status::StartFailed,
+    fn of(
+        connected: Option<bool>,
+        starting: bool,
+        start_failed: bool,
+        mismatch: Option<u32>,
+    ) -> Self {
+        match (connected, starting, start_failed, mismatch) {
+            (_, true, ..) => Status::Starting,
+            (_, _, true, _) => Status::StartFailed,
+            (_, _, _, Some(n)) => Status::WrongProtocol(n),
             (Some(true), ..) => Status::Up,
             (Some(false), ..) => Status::Down,
             (None, ..) => Status::Checking,
@@ -441,19 +523,26 @@ impl Status {
         match self {
             Status::Up => theme::ok(),
             Status::Down => theme::warn(),
-            Status::StartFailed => theme::danger(),
+            Status::StartFailed | Status::WrongProtocol(_) => theme::danger(),
             Status::Starting | Status::Checking => text_muted(),
         }
     }
 
     fn label(self) -> Cow<'static, str> {
-        i18n::t(match self {
+        let key = match self {
             Status::Starting => "gui.status.starting",
             Status::StartFailed => "gui.status.start_failed",
             Status::Up => "gui.status.connected",
             Status::Down => "gui.status.down",
             Status::Checking => "gui.status.checking",
-        })
+            Status::WrongProtocol(n) => {
+                return Cow::Owned(i18n::tf(
+                    "gui.status.protocol_mismatch",
+                    &[("protocol", &n)],
+                ));
+            }
+        };
+        i18n::t(key)
     }
 }
 
@@ -513,10 +602,8 @@ fn effective_locale(choice: Option<Locale>) -> Locale {
 struct App {
     section: Section,
     focus: FocusHandle,
-    /// `None` until the first probe answers.
-    connected: Option<bool>,
-    /// Consecutive failed probes (see [`settle`]).
-    misses: u8,
+    /// What the panel believes about the resident; only [`next_link`] changes it.
+    link: Link,
     starting: bool,
     start_failed: bool,
     /// Language picked in the selector (`None` = system).
@@ -537,9 +624,9 @@ impl App {
         // Probe the resident every 2 s (off the UI thread) for the sidebar indicator.
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                let up = cx.background_executor().spawn(async { probe() }).await;
+                let found = cx.background_executor().spawn(async { probe() }).await;
                 if this
-                    .update_in(cx, |t, window, cx| t.on_probe(up, window, cx))
+                    .update_in(cx, |t, window, cx| t.on_probe(found, window, cx))
                     .is_err()
                 {
                     break;
@@ -597,8 +684,7 @@ impl App {
         Self {
             section: Section::Windows,
             focus: cx.focus_handle(),
-            connected: None,
-            misses: 0,
+            link: Link::default(),
             starting: false,
             start_failed: false,
             language: settings::default_path().and_then(|p| settings::load(&p).settings.language),
@@ -613,28 +699,23 @@ impl App {
         }
     }
 
-    /// Apply a debounced probe result (see [`settle`]).
-    fn on_probe(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let (up, misses) = settle(self.connected, self.misses, up);
-        self.misses = misses;
+    /// Apply a probe result through [`next_link`].
+    fn on_probe(&mut self, found: Probe, window: &mut Window, cx: &mut Context<Self>) {
+        let prev = self.link;
+        self.link = next_link(prev, found);
+        let up = self.link.connected == Some(true);
+        if up {
+            self.starting = false;
+            self.start_failed = false;
+        }
         // The tray (or Task Manager) may have changed it since the last tick.
         let autostart = read_autostart();
         if autostart != self.autostart {
             self.autostart = autostart;
             cx.notify();
         }
-        self.set_connected(up, window, cx);
-    }
-
-    fn set_connected(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if up {
-            self.misses = 0;
-            self.starting = false;
-            self.start_failed = false;
-        }
-        if self.connected != Some(up) {
-            self.connected = Some(up);
-            if up {
+        if (self.link.connected, self.link.mismatch) != (prev.connected, prev.mismatch) {
+            if up && prev.connected != Some(true) {
                 self.refresh_visible(window, cx);
             }
             cx.notify();
@@ -691,20 +772,20 @@ impl App {
             return;
         }
         cx.spawn_in(window, async move |this, cx| {
-            let mut up = false;
+            let mut found = Probe::Down;
             for _ in 0..20 {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
-                up = cx.background_executor().spawn(async { probe() }).await;
-                if up {
+                found = cx.background_executor().spawn(async { probe() }).await;
+                if found != Probe::Down {
                     break;
                 }
             }
             this.update_in(cx, |t, window, cx| {
                 t.starting = false;
-                t.start_failed = !up;
-                t.set_connected(up, window, cx);
+                t.start_failed = found == Probe::Down;
+                t.on_probe(found, window, cx);
                 cx.notify();
             })
             .ok();
@@ -725,9 +806,14 @@ impl App {
     }
 
     fn connection_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = Status::of(self.connected, self.starting, self.start_failed);
+        let status = Status::of(
+            self.link.connected,
+            self.starting,
+            self.start_failed,
+            self.link.mismatch,
+        );
         let (dot, label) = (status.dot(), status.label());
-        let down = self.connected == Some(false);
+        let down = self.link.connected == Some(false) && self.link.mismatch.is_none();
         div()
             .flex()
             .flex_col()
@@ -835,7 +921,12 @@ impl Render for App {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (font, size) = (theme.font_family.clone(), theme.font_size);
-        let status = Status::of(self.connected, self.starting, self.start_failed);
+        let status = Status::of(
+            self.link.connected,
+            self.starting,
+            self.start_failed,
+            self.link.mismatch,
+        );
         let nav = Section::ALL
             .iter()
             .fold(div().flex().flex_col().gap(SP_1), |col, &s| {
@@ -999,6 +1090,65 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
     use crate::ipc::ErrorCode;
+
+    fn hello(protocol: u32) -> Result<Value, CallError> {
+        Ok(json!({"protocol": protocol, "version": "0", "pid": 1, "profiles_revision": "r"}))
+    }
+
+    #[test]
+    fn a_resident_on_another_protocol_is_refused_before_any_request() {
+        let other = crate::ipc::PROTOCOL + 1;
+        assert_eq!(judge(hello(crate::ipc::PROTOCOL)), Ok(()));
+        assert_eq!(judge(hello(other)), Err(Failure::Protocol(other)));
+        // A hello that is not a hello, or no answer, is a transport failure, not a mismatch.
+        assert_eq!(judge(Ok(json!({"protocol": "3"}))), Err(Failure::Transport));
+        assert_eq!(
+            judge(Err(CallError::Ipc(IpcError::Closed))),
+            Err(Failure::Transport)
+        );
+    }
+
+    #[test]
+    fn probe_tells_a_mismatch_from_up_and_down() {
+        let other = crate::ipc::PROTOCOL + 1;
+        assert_eq!(probe_of(hello(crate::ipc::PROTOCOL)), Probe::Up);
+        assert_eq!(probe_of(hello(other)), Probe::WrongProtocol(other));
+        assert_eq!(probe_of(Ok(json!({}))), Probe::Down);
+    }
+
+    #[test]
+    fn a_protocol_mismatch_has_its_own_sentence_status_and_code_in_both_languages() {
+        let _g = i18n::scoped_locale(Locale::En);
+        let (s, code) = failure_text(&Failure::Protocol(9));
+        assert_eq!(code, "protocol_mismatch");
+        assert!(
+            s.contains("protocol 9") && s.contains("different version"),
+            "{s}"
+        );
+        let st = Status::of(Some(false), false, false, Some(9));
+        assert_eq!(st, Status::WrongProtocol(9));
+        assert_ne!(st.dot(), Status::Down.dot());
+        assert_eq!(
+            st.label(),
+            "Borderless Shatter is running a different version (protocol 9); restart it"
+        );
+        // Starting or a failed start still wins over a stale mismatch.
+        assert_eq!(Status::of(None, true, false, Some(9)), Status::Starting);
+        let en_label = st.label();
+        i18n::set_locale(Locale::Es);
+        let catalog_es: Value =
+            serde_json::from_str(include_str!("../../locales/es/common.json")).expect("catalog");
+        let (es, _) = failure_text(&Failure::Protocol(9));
+        assert!(
+            es == catalog_es["common.error.protocol_mismatch"]
+                .as_str()
+                .expect("es sentence")
+                .replace("{protocol}", "9"),
+            "{es}"
+        );
+        let es_label = st.label();
+        assert!(es_label.contains('9') && es_label != en_label, "{es_label}");
+    }
 
     #[test]
     fn unset_instance_keeps_the_original_names() {
@@ -1220,23 +1370,109 @@ mod tests {
     }
 
     #[test]
-    fn one_missed_probe_keeps_a_connected_panel_up_and_two_bring_it_down() {
-        assert_eq!(settle(Some(true), 0, false), (true, 1));
-        assert_eq!(settle(Some(true), 1, false), (false, 2));
-        assert_eq!(settle(Some(true), 1, true), (true, 0));
-        // Never connected: no grace, the first failure shows "down".
-        assert_eq!(settle(None, 0, false), (false, 1));
-        assert_eq!(settle(Some(false), 0, false), (false, 1));
+    fn link_first_probe_is_taken_as_is() {
+        assert_eq!(run(&[Probe::Down]).connected, Some(false));
+        assert_eq!(run(&[Probe::Up]).connected, Some(true));
+        assert_eq!(run(&[Probe::WrongProtocol(9)]).mismatch, Some(9));
+    }
+
+    fn run(probes: &[Probe]) -> Link {
+        probes.iter().fold(Link::default(), |l, &p| next_link(l, p))
+    }
+
+    #[test]
+    fn link_up_down_down_is_down() {
+        let l = run(&[Probe::Up, Probe::Down, Probe::Down]);
+        assert_eq!((l.connected, l.mismatch), (Some(false), None));
+    }
+
+    #[test]
+    fn link_up_down_up_never_flickers() {
+        let mut l = Link::default();
+        for p in [Probe::Up, Probe::Down, Probe::Up] {
+            l = next_link(l, p);
+            assert_eq!(l.connected, Some(true));
+        }
+    }
+
+    #[test]
+    fn link_wrong_protocol_is_immediate_and_not_connected() {
+        let l = run(&[Probe::Up, Probe::WrongProtocol(9)]);
+        assert_eq!((l.connected, l.mismatch), (Some(false), Some(9)));
+    }
+
+    #[test]
+    fn link_mismatch_survives_one_down() {
+        let l = run(&[Probe::WrongProtocol(9), Probe::Down]);
+        assert_eq!((l.connected, l.mismatch), (Some(false), Some(9)));
+    }
+
+    #[test]
+    fn link_mismatch_clears_after_two_downs_so_start_shows() {
+        let l = run(&[Probe::WrongProtocol(9), Probe::Down, Probe::Down]);
+        assert_eq!((l.connected, l.mismatch), (Some(false), None));
+    }
+
+    #[test]
+    fn link_up_clears_a_mismatch() {
+        let l = run(&[Probe::WrongProtocol(9), Probe::Up]);
+        assert_eq!((l.connected, l.mismatch), (Some(true), None));
+    }
+
+    /// #84 in the panel itself: a connected resident that stops answering brings back Start.
+    #[gpui_kit::test]
+    fn a_connected_panel_shows_start_after_two_failed_probes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::base::test_support::find;
+        let (win, app) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install(cx);
+            let opts = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Default::default(),
+                    size: size(px(1200.), px(2000.)),
+                })),
+                ..Default::default()
+            };
+            gpui_kit::open_window(opts, cx, |w, cx| cx.new(|cx| App::new(w, cx))).unwrap()
+        });
+        let mut cx = gpui_kit::VisualTestContext::from_window(win, cx);
+        cx.run_until_parked(); // the first real probe: tests never reach a resident
+        let start_shown = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|w, _| find(w, &[], &"start-resident".into()))
+                .is_some_and(|e| e.visible())
+        };
+        let probe = |cx: &mut gpui_kit::VisualTestContext, p| {
+            cx.update(|w, a| app.update(a, |t, cx| t.on_probe(p, w, cx)))
+        };
+        probe(&mut cx, Probe::Up);
+        assert!(!start_shown(&mut cx), "connected: no Start button");
+        probe(&mut cx, Probe::Down);
+        assert!(!start_shown(&mut cx), "one failed probe keeps it connected");
+        probe(&mut cx, Probe::Down);
+        assert!(
+            start_shown(&mut cx),
+            "two failed probes: down, Start is back"
+        );
     }
 
     #[test]
     fn status_dot_follows_the_connection_not_the_accent() {
-        assert_eq!(Status::of(Some(true), false, false).dot(), theme::ok());
-        assert_eq!(Status::of(Some(false), false, false).dot(), theme::warn());
-        assert_ne!(Status::of(Some(false), false, false).dot(), theme::accent());
-        assert_eq!(Status::of(Some(true), true, false), Status::Starting);
-        assert_eq!(Status::of(None, false, true), Status::StartFailed);
-        assert_eq!(Status::of(None, false, false), Status::Checking);
+        assert_eq!(
+            Status::of(Some(true), false, false, None).dot(),
+            theme::ok()
+        );
+        assert_eq!(
+            Status::of(Some(false), false, false, None).dot(),
+            theme::warn()
+        );
+        assert_ne!(
+            Status::of(Some(false), false, false, None).dot(),
+            theme::accent()
+        );
+        assert_eq!(Status::of(Some(true), true, false, None), Status::Starting);
+        assert_eq!(Status::of(None, false, true, None), Status::StartFailed);
+        assert_eq!(Status::of(None, false, false, None), Status::Checking);
     }
 
     #[test]

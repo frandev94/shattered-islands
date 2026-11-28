@@ -9,6 +9,7 @@
   "gui.status.start_failed": "No se pudo iniciar Borderless Shatter",
   "gui.status.connected": "Conectado",
   "gui.status.down": "Borderless Shatter no está en marcha",
+  "gui.status.protocol_mismatch": "Borderless Shatter se está ejecutando en otra versión (protocolo {protocol}); reinícialo",
   "gui.status.start": "Iniciar",
   "gui.error.code": "Código: {code}",
   "gui.notice.done": "Hecho",

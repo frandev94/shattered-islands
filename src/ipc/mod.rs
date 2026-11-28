@@ -35,6 +35,25 @@ use crate::window_state::{Offsets, Rect};
 
 /// Protocol revision returned by `hello`; clients must refuse a different one.
 pub const PROTOCOL: u32 = 3;
+/// The protocol a `hello` declares when it is not ours (`None`: same revision). The single
+/// comparison CLI, MCP and the panel share; it reads only `protocol`, so another change to the
+/// `hello` shape never reads as "not running".
+pub fn protocol_mismatch(hello: &Value) -> Result<Option<u32>, IpcError> {
+    let protocol = u32::deserialize(&hello["protocol"])?;
+    Ok((protocol != PROTOCOL).then_some(protocol))
+}
+
+/// `hello` result → `Ok` only for our protocol revision (CLI and MCP).
+pub fn check_hello(hello: Value) -> Result<(), CallError> {
+    match protocol_mismatch(&hello)? {
+        None => Ok(()),
+        Some(protocol) => Err(IpcError::Protocol(format!(
+            "the resident speaks protocol {protocol} and this client {PROTOCOL}"
+        ))
+        .into()),
+    }
+}
+
 /// Maximum length of one JSON line (without the trailing `\n`).
 pub const MAX_LINE: usize = 1 << 20;
 /// Upper bound of `diagnose.observe_ms`.
@@ -912,6 +931,38 @@ pub struct DiagnoseResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn hello(protocol: Value) -> Value {
+        json!({"protocol": protocol, "version": "0", "pid": 1, "profiles_revision": "r"})
+    }
+
+    #[test]
+    fn protocol_mismatch_reads_only_the_revision() {
+        assert_eq!(
+            protocol_mismatch(&hello(json!(PROTOCOL))).expect("hello"),
+            None
+        );
+        assert_eq!(protocol_mismatch(&hello(json!(7))).expect("hello"), Some(7));
+        // Any other field may change shape without hiding the revision.
+        let odd = json!({"protocol": PROTOCOL + 1, "pid": "not a number"});
+        assert_eq!(protocol_mismatch(&odd).expect("hello"), Some(PROTOCOL + 1));
+        assert!(matches!(
+            protocol_mismatch(&hello(json!("3"))),
+            Err(IpcError::Json(_))
+        ));
+        assert!(protocol_mismatch(&json!({})).is_err());
+    }
+
+    #[test]
+    fn check_hello_accepts_only_our_protocol() {
+        assert!(check_hello(hello(json!(PROTOCOL))).is_ok());
+        let err = check_hello(hello(json!(PROTOCOL + 1))).expect_err("mismatch");
+        assert!(
+            matches!(&err, CallError::Ipc(IpcError::Protocol(m))
+                if m.contains(&(PROTOCOL + 1).to_string())),
+            "{err:?}"
+        );
+    }
 
     /// `v` must survive deserialise → serialise unchanged (canonical form).
     fn roundtrip<T: Serialize + DeserializeOwned>(v: Value) {

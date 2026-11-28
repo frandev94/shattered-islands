@@ -428,7 +428,7 @@ fn call(inv: &Invocation) -> Outcome {
     };
     if let Err(e) = client
         .call("hello", Value::Object(Map::new()))
-        .and_then(crate::mcp::check_hello)
+        .and_then(crate::ipc::check_hello)
     {
         return Outcome::Unreachable(tf("cli.error.protocol", &[("reason", &e)]));
     }
