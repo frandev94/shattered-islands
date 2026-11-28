@@ -10,8 +10,8 @@
 //! Each case starts its own resident (`BORDERLESS_SHATTER_INSTANCE` suffix, temp `APPDATA` and
 //! `LOCALAPPDATA` under `target/e2e-tmp/`) and `examples/testwin` windows, measures them with
 //! Win32 directly and only touches what it created; the harness guard cleans up even on panic.
-//! Profiles are only ever written for the fake process `e2e-fake.exe`: a `testwin.exe` profile
-//! would make the resident act on its own.
+//! Profiles are written for the fake process `e2e-fake.exe`, except the title-matched cases at the
+//! end of the file: a `testwin.exe` profile makes the resident act on every testwin.
 
 mod common;
 
@@ -166,7 +166,7 @@ fn hello_and_protocol_errors() {
     let mut h = Harness::new("hello_and_protocol_errors");
     let mut c = h.start_resident();
     let hi = hello(&mut c);
-    assert_eq!(hi.protocol, 2);
+    assert_eq!(hi.protocol, 3);
     assert_eq!(hi.pid, h.resident_pid());
     assert_eq!(hi.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(hi.profiles_revision.len(), 64);
@@ -200,7 +200,7 @@ fn hello_and_protocol_errors() {
     assert_eq!(v["error"]["code"], "invalid_json", "{v}");
     let v = exchange("{\"id\":\"abc\",\"method\":\"hello\"}\n");
     assert_eq!(v["id"], "abc", "{v}");
-    assert_eq!(v["result"]["protocol"], 2, "{v}");
+    assert_eq!(v["result"]["protocol"], 3, "{v}");
     // A repeated key is `invalid_params`; a repeated `id` is answered with id 0.
     let v = exchange("{\"id\":5,\"id\":6,\"method\":\"hello\"}\n");
     assert_eq!(v["id"], 0, "{v}");
@@ -1298,4 +1298,124 @@ fn readoption_keeps_unresolvable_island() {
         "persist after readopt must keep the unresolvable ref in state.json"
     );
     expect_restored(&mut c, &w);
+}
+
+// ------------------------------------------------------------- title-matched profiles
+//
+// These seed `profiles.json` with `testwin.exe` rules (the only process the fake game can be), so
+// the resident acts on every testwin on the desktop: run them with no other testwin around.
+
+const TITLE_WAIT: Duration = Duration::from_secs(5);
+
+/// Starts a resident on `profiles` (the `profiles` array body) and returns it with the harness.
+fn resident_with_profiles(test: &str, profiles: Value) -> (Harness, Client) {
+    let mut h = Harness::new(test);
+    h.write_profiles(&json!({ "version": 2, "profiles": profiles }).to_string());
+    let c = h.start_resident();
+    (h, c)
+}
+
+fn managed(c: &mut Client, w: &TestWin) -> bool {
+    managed_hwnds(c).contains(&w.hwnd)
+}
+
+fn island_of(c: &mut Client, w: &TestWin) -> Option<String> {
+    windows(c, true)
+        .into_iter()
+        .find(|i| i.hwnd == w.hwnd)
+        .and_then(|i| i.island)
+}
+
+fn wait_managed(c: &mut Client, w: &TestWin) {
+    wait_until("the window to be managed", TITLE_WAIT, || managed(c, w));
+}
+
+/// Creates real windows (resident + 2 testwin); see module docs.
+///
+/// An exact title beats the process-only profile; a window with another title falls back to it.
+#[test]
+#[ignore = "creates real windows; see module docs"]
+fn title_profile_beats_process_only_profile() {
+    let (mut h, mut c) = resident_with_profiles(
+        "title_profile_beats_process_only_profile",
+        json!([
+            { "process": "testwin.exe", "island": LEFT },
+            { "process": "testwin.exe", "title": "E2E-P", "island": RIGHT },
+        ]),
+    );
+    let titled = h.testwin(&["--title", "E2E-P"]);
+    let plain = h.testwin(NOTEPAD);
+    wait_managed(&mut c, &titled);
+    wait_managed(&mut c, &plain);
+    assert_eq!(island_of(&mut c, &titled).as_deref(), Some(RIGHT));
+    assert_eq!(island_of(&mut c, &plain).as_deref(), Some(LEFT));
+}
+
+/// Creates real windows (resident + 2 testwin); see module docs.
+#[test]
+#[ignore = "creates real windows; see module docs"]
+fn title_regex_profile_manages_only_matching_titles() {
+    let (mut h, mut c) = resident_with_profiles(
+        "title_regex_profile_manages_only_matching_titles",
+        json!([{ "process": "testwin.exe", "title_regex": "^E2E-R\\d+$", "island": RIGHT }]),
+    );
+    // The non-matching window comes first, so it has had longer than the matching one.
+    let other = h.testwin(NOTEPAD);
+    let hit = h.testwin(&["--title", "E2E-R7"]);
+    wait_managed(&mut c, &hit);
+    assert_eq!(island_of(&mut c, &hit).as_deref(), Some(RIGHT));
+    assert!(!managed(&mut c, &other), "e2e-win-1 must stay unmanaged");
+}
+
+/// Creates real windows (resident + testwin); see module docs.
+///
+/// A game that renames its window after loading is picked up once the title matches.
+#[test]
+#[ignore = "creates real windows; see module docs"]
+fn late_title_profile_manages_after_rename() {
+    let (mut h, mut c) = resident_with_profiles(
+        "late_title_profile_manages_after_rename",
+        json!([{ "process": "testwin.exe", "title": "E2E-LATE", "island": RIGHT }]),
+    );
+    let w = h.testwin(&["--title", "loading", "--late-title", "3000:E2E-LATE"]);
+    assert!(
+        !w.log_text().contains("title changed"),
+        "the rename came too early: {}",
+        w.log_text()
+    );
+    assert!(!managed(&mut c, &w), "managed before the rename");
+    wait_until("the rename", Duration::from_secs(6), || {
+        w.log_text().contains("title changed to E2E-LATE")
+    });
+    wait_managed(&mut c, &w);
+    assert_eq!(island_of(&mut c, &w).as_deref(), Some(RIGHT));
+}
+
+/// Creates real windows (resident + 2 testwin); see module docs.
+///
+/// The windows exist before the resident, so `orig` is their state before any placement and the
+/// resident manages them from its startup scan.
+#[test]
+#[ignore = "creates real windows; see module docs"]
+fn restore_all_restores_title_matched_windows() {
+    let mut h = Harness::new("restore_all_restores_title_matched_windows");
+    h.write_profiles(
+        &json!({ "version": 2, "profiles": [
+            { "process": "testwin.exe", "title": "E2E-P", "island": LEFT },
+            { "process": "testwin.exe", "title_regex": "^E2E-R\\d+$", "island": RIGHT },
+        ]})
+        .to_string(),
+    );
+    let exact = h.testwin(&["--title", "E2E-P"]);
+    let regex = h.testwin(&["--title", "E2E-R1"]);
+    let mut c = h.start_resident();
+    wait_managed(&mut c, &exact);
+    wait_managed(&mut c, &regex);
+
+    let r: RestoreAllResult = call(&mut c, "restore_all", json!({}));
+    assert_eq!(r.restored, 2);
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert_eq!(snap(exact.hwnd), exact.orig);
+    assert_eq!(snap(regex.hwnd), regex.orig);
+    assert!(managed_hwnds(&mut c).is_empty());
 }
