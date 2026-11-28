@@ -78,7 +78,7 @@ Tray menu:
 | Action | Effect |
 |---|---|
 | `Open panel` | Opens the panel |
-| `Apply: <process>` (one per profile) | Applies the profile to that process's windows now |
+| `Apply: <process>` (one per process) | Applies the profiles to that process's windows now: each window gets its best match among that process's profiles (see [Window title rules](#window-title-rules)); a window whose best match is disabled is left alone |
 | `Place active window in island` | Submenu with one entry per `layout/island` |
 | `Restore all` | Returns all windows to their original state |
 | `Reload profiles` | Re-reads `profiles.json` and rebuilds the menu |
@@ -91,7 +91,7 @@ Panel views:
 - **Windows**: lists the open windows with their managed state (and the island or "fights back" flag), with search, "Managed only" and "Show all" filters, and "Restore all".
 - **Islands**: shows the monitors and their islands to scale, with the window that occupies each one.
 - **Island editor**: creates and edits layouts and islands by dragging, snapping or typing values. The built-in preset is read-only: "Duplicate to edit" makes an editable copy.
-- **Profiles**: edits the per-game profiles (island, game resolution, delay, enabled). If the profile changes outside the panel while you edit it, your typed values are kept: fields you did not touch take the saved version, and a field changed on both sides shows the outside value until you choose (an island and the offsets or monitor, or width and height, count as one field when they clash). Choose "Keep mine and overwrite" to save your value with the new revision, or "Use the outside values" to replace only the marked fields. Cancel discards everything.
+- **Profiles**: edits the per-game profiles (window rule, island, game resolution, delay, enabled). Under the process, "Window" chooses which of its windows the profile takes: "Any window", "Exact title" (ignores case and spaces at the start and end) or "Title (regex)" (searched anywhere in the title; `^…$` for the whole title); a regular expression that does not compile is flagged inline. The list shows the rule under the process and orders each process's profiles by precedence (exact title, regex, any window), then file order; search also looks at the rule. The process and the rule of an existing profile cannot be changed: create another profile and remove the old one. A profile with both `title` and `title_regex` (edited by hand) can only be deleted from its form. If the profile changes outside the panel while you edit it, your typed values are kept: fields you did not touch take the saved version, and a field changed on both sides shows the outside value until you choose (an island and the offsets or monitor, or width and height, count as one field when they clash). Choose "Keep mine and overwrite" to save your value with the new revision, or "Use the outside values" to replace only the marked fields. Cancel discards everything.
 - **Diagnostics**: applies a profile to a window and measures how the game reverts the style and the size, with a verdict and recommendations.
 
 Language: the panel has a language selector (System, English, Spanish). The choice is stored in `settings.json`. The language is picked in this order: the `BORDERLESS_SHATTER_LANG` environment variable (`en` or `es`), then `settings.json`, then the Windows display language (Spanish if it is Spanish, English otherwise). The tray menu picks the new language the next time the program starts. MCP tool descriptions and the engine's error messages are always English.
@@ -129,6 +129,16 @@ A key repeated in any object, or an array where an object is expected (`offsets`
       "process": "notepad.exe",
       "monitor": "current",
       "offsets": { "left": 0, "top": 0, "right": 0, "bottom": 0 }
+    },
+    {
+      "process": "Game.exe",
+      "title_regex": "^Game - Level \\d+$",
+      "island": "halves-16-9/right"
+    },
+    {
+      "process": "Game.exe",
+      "title": "Game Launcher",
+      "enabled": false
     }
   ]
 }
@@ -140,6 +150,8 @@ A key repeated in any object, or an array where an object is expected (`offsets`
 | `layouts` | list | empty | Your layouts, merged over the built-in presets |
 | `profiles` | list | empty | Profiles |
 | `process` | text | required | Executable name |
+| `title` | text | none | Only windows whose title is exactly this text, ignoring case and spaces at the start and end. Cannot be combined with `title_regex` |
+| `title_regex` | text | none | Only windows whose title matches this regular expression ([`regex`](https://docs.rs/regex) syntax, linear time). It is searched anywhere in the title: use `^…$` for the whole title and `(?i)` to ignore case. A pattern over 1 MiB compiled (for example `\w{50}`) is rejected like one that does not compile. Cannot be combined with `title` |
 | `enabled` | boolean | `true` | If `false`, the profile is not applied |
 | `island` | text | none | `"layout/island"`; overrides `monitor` and `offsets` |
 | `game_resolution` | `{width, height}` | none | Declared game resolution in physical pixels; the window is centred in the island |
@@ -151,6 +163,20 @@ A key repeated in any object, or an array where an object is expected (`offsets`
 Fields the program does not know are kept when the file is saved, at the file level and inside each profile, layout and island (not inside `rect`, `offsets`, `game_resolution` or `monitor`). Saving from the panel keeps them. When `set_profiles` replaces a profile, layout or island, it keeps the old unknown fields unless the new item brings its own; islands are matched by `id`. To remove them, send the items without them and `"replace_extras": true`: each sent item is stored exactly as sent, and items not sent are untouched.
 
 An older resident on the same pipe ignores `replace_extras` (it does not reject unknown params), so the call succeeds and keeps the old keys; avoid mixing versions. Duplicating a layout in the editor copies its unknown keys and its islands' keys (intended). Unknown keys at the top level of `profiles.json` cannot be cleared through `set_profiles`; edit the file by hand.
+
+### Window title rules
+
+A process can have several profiles: one without a title rule (any window of the process) plus profiles with `title` or `title_regex`. A profile is identified by its process and its rule, so two profiles with the same process and the same rule are duplicates (`duplicate_profile`; the first one in the file wins).
+
+For a window, the candidates are the profiles of its process whose rule matches its title. The most specific wins: an exact `title`, then a `title_regex`, then the profile without a rule; between equals, the first one in the file. A disabled profile also competes: if it wins, the window is left alone, which is how a launcher window is excluded (the `Game Launcher` profile above). A regular expression that does not compile, an empty rule, or both rules in one profile never match. Excluded system processes stay excluded whatever the rule.
+
+Late titles: a window that is not managed yet is checked when it appears, when it comes to the foreground, and when its title changes. A title change only applies a profile with a title rule, so games that show their frame rate in the title are not re-checked against their process-only profile, and a window that could not be placed is retried when it comes to the foreground again, not on every title change. A managed window keeps the profile it got, whatever its title becomes, until it is restored. If a profile without a rule matches first (for example while the game still shows a loading title), it wins, and a later title does not switch the window to another profile.
+
+`set_profiles` (pipe, MCP, `profiles set`) creates or replaces profiles by process and rule. Its `remove` list takes a process name, which removes only the profile without a title rule of that process, or an object `{"process": "Game.exe", "title": "Game Launcher"}` (or with `title_regex`), which removes that profile; any other field in the object is rejected, so a misspelt rule never removes the profile without a rule:
+
+```json
+{ "remove": ["notepad.exe", { "process": "Game.exe", "title_regex": "^Game - Level \\d+$" }] }
+```
 
 ## Islands
 
@@ -278,7 +304,7 @@ Flags, as they appear in the code:
 - `--reposition keep|center-on-request|offset:X,Y|game-unity` (default `keep`).
 - `--late-frame MS`: restores the frame after MS milliseconds.
 - `--dpi aware|unaware` (default `aware`). With `unaware`, Windows virtualizes the window: 1920x1080 appears as 2400x1350 physical pixels at 125%.
-- `--client WxH` (default 1280x720, in the window's DPI space), `--pos X,Y` (default 100,100), `--delay MS` (default 1500; only used by `late-frame`), `--title TEXT`, `--log PATH`.
+- `--client WxH` (default 1280x720, in the window's DPI space), `--pos X,Y` (default 100,100), `--delay MS` (default 1500; only used by `late-frame`), `--title TEXT`, `--late-title MS:TEXT` (changes the title to TEXT after MS milliseconds, as a game that renames its window once it has loaded), `--log PATH`.
 
 The old `--mode` names (`normal`, `fixed`, `revert-style`, `force-size`, `warscape`, `late-frame`) still work.
 

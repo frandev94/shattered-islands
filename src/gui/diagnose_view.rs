@@ -608,8 +608,19 @@ enum Run {
 /// Emitted by "Use as the game's resolution"; the shell opens Profiles with it. Saves nothing.
 pub struct UseGameResolution {
     pub process: String,
+    /// Title of the diagnosed window: the shell opens the profile that matches it. `None` when
+    /// the window is no longer selected: only the process-only profile is opened then.
+    pub title: Option<String>,
     pub width: i32,
     pub height: i32,
+}
+
+/// Title of window `hwnd` if it belongs to `process` (the one the report is about).
+fn diagnosed_title(infos: &[WindowInfo], hwnd: Option<isize>, process: &str) -> Option<String> {
+    infos
+        .iter()
+        .find(|w| Some(w.hwnd) == hwnd && w.process.eq_ignore_ascii_case(process))
+        .map(|w| w.title.clone())
 }
 
 pub struct DiagnoseView {
@@ -1101,6 +1112,7 @@ impl DiagnoseView {
         let all = recommendations_text(&res.recommendations, &res.process);
         let forced = res.forced_size;
         let process = res.process.clone();
+        let title = diagnosed_title(&self.win_infos, self.window_hwnd, &res.process);
         card()
             .flex()
             .flex_col()
@@ -1154,6 +1166,7 @@ impl DiagnoseView {
                             cx.listener(move |_, _, _, cx| {
                                 cx.emit(UseGameResolution {
                                     process: process.clone(),
+                                    title: title.clone(),
                                     width: s.width,
                                     height: s.height,
                                 });
@@ -2147,5 +2160,44 @@ mod tests {
             prop_assert!(t.windows(2).all(|w| w[0] <= w[1]));
             prop_assert!(t.iter().all(|x| *x >= vs && *x <= ve));
         }
+    }
+
+    fn info(hwnd: isize, process: &str, title: &str) -> WindowInfo {
+        use crate::ipc::{ClientSize, WindowMonitor};
+        WindowInfo {
+            hwnd,
+            pid: 1,
+            process: process.into(),
+            title: title.into(),
+            class: "C".into(),
+            visible: true,
+            style: "0x0".into(),
+            exstyle: "0x0".into(),
+            rect: Rect::default(),
+            client: ClientSize { w: 1, h: 1 },
+            monitor: WindowMonitor {
+                index: 0,
+                device: "D".into(),
+            },
+            dpi: 96,
+            dpi_awareness: DpiAwareness::PerMonitorV2,
+            elevated: Some(false),
+            maximized: false,
+            minimized: false,
+            managed: false,
+            island: None,
+        }
+    }
+
+    #[test]
+    fn the_diagnosed_title_is_the_selected_window_of_the_reported_process() {
+        let wins = [info(1, "game.exe", "Menu"), info(2, "other.exe", "Lobby")];
+        assert_eq!(
+            diagnosed_title(&wins, Some(1), "Game.exe").as_deref(),
+            Some("Menu")
+        );
+        // another window selected since, or a different process: no title, never a wrong one
+        assert_eq!(diagnosed_title(&wins, Some(2), "game.exe"), None);
+        assert_eq!(diagnosed_title(&wins, None, "game.exe"), None);
     }
 }

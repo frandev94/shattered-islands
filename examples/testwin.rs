@@ -9,7 +9,7 @@
 //!                [--style frame|fixed|popup] [--revert-style MS] [--force-size MS]
 //!                [--reposition keep|center-on-request|offset:X,Y|game-unity] [--late-frame MS]
 //!                [--dpi aware|unaware] [--client WxH] [--pos X,Y] [--delay MS]
-//!                [--title TEXT] [--log PATH]
+//!                [--title TEXT] [--late-title MS:TEXT] [--log PATH]
 //!
 //! `--client` is in the window's own DPI space: with `--dpi unaware` Windows virtualizes and
 //! bitmap-stretches the window (client 1920x1080 becomes 2400x1350 physical at 125 %).
@@ -71,6 +71,8 @@ struct Cfg {
     pos: (i32, i32),
     delay: u32,
     title: Option<String>,
+    /// `--late-title MS:TEXT`: rename the window to TEXT after MS ms.
+    late_title: Option<(u32, String)>,
     log: Option<String>,
     start: Instant,
 }
@@ -152,6 +154,12 @@ fn apply(c: &mut Cfg, flag: &str, val: &str) {
         "--client" => c.client = pair(val, 'x'),
         "--pos" => c.pos = pair(val, ','),
         "--title" => c.title = Some(val.into()),
+        "--late-title" => {
+            let (t, text) = val
+                .split_once(':')
+                .unwrap_or_else(|| panic!("--late-title wants MS:TEXT, got {val}"));
+            c.late_title = Some((num(t), text.into()));
+        }
         "--log" => c.log = Some(val.into()),
         "--delay" => {} // read up front for `--mode late-frame`
         other => panic!("unknown argument {other}"),
@@ -172,6 +180,7 @@ fn parse_args() -> Cfg {
         pos: (100, 100),
         delay: 1500,
         title: None,
+        late_title: None,
         log: None,
         start: Instant::now(),
     };
@@ -225,6 +234,8 @@ fn describe(c: &Cfg) -> [String; 2] {
 const T_REVERT: usize = 1;
 const T_FORCE: usize = 2;
 const T_LATE: usize = 3;
+/// Not a reaction (no `armed` slot): renames the window once.
+const T_TITLE: usize = 4;
 
 #[derive(Default)]
 struct State {
@@ -549,6 +560,18 @@ fn on_paint(hwnd: HWND) {
     }
 }
 
+fn rename(hwnd: HWND) {
+    // SAFETY: hwnd is live; killing an unarmed timer just fails.
+    unsafe { _ = KillTimer(Some(hwnd), T_TITLE) };
+    let Some((_, text)) = &cfg().late_title else {
+        return;
+    };
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    unsafe { SetWindowTextW(hwnd, PCWSTR(wide.as_ptr())).ok() };
+    log(&format!("title changed to {text}"));
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_STYLECHANGED => on_style_changed(hwnd, wparam, lparam),
@@ -559,6 +582,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return res;
         }
         WM_TIMER if (T_REVERT..=T_LATE).contains(&wparam.0) => fire(hwnd, wparam.0),
+        WM_TIMER if wparam.0 == T_TITLE => rename(hwnd),
         WM_PAINT => on_paint(hwnd),
         WM_CLOSE => log("WM_CLOSE"),
         WM_DESTROY => {
@@ -640,6 +664,9 @@ fn main() {
             GetDpiForWindow(hwnd),
             c.name
         ));
+        if let Some((delay, _)) = &c.late_title {
+            SetTimer(Some(hwnd), T_TITLE, *delay, None);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {

@@ -42,12 +42,12 @@ flowchart LR
 | `window_state.rs` | Pure style masks and rect math. |
 | `guard.rs` | Pure state machine (injected clock) for re-assertions and `fights_back`. |
 | `islands.rs` | Layouts and islands to physical rects (edges rounded, not sizes); monitor resolution. |
-| `profiles.rs` | Serde model v2 (layouts, islands, `game_resolution`), v1 migration, validation, atomic save, `revision`. |
+| `profiles.rs` | Serde model v2 (layouts, islands, `game_resolution`, title rules), v1 migration, matching with precedence (`find`), profile identity (`ProfileKey`), validation, atomic save, `revision`. |
 | `settings.rs` | `settings.json` (language). |
 | `autostart.rs` | Start at sign-in: the per-user `HKCU\...\Run` value and Task Manager's `StartupApproved` mark. Pure helpers (value name, quoting, blob parsing, classification) plus the registry calls. |
 | `state_store.rs` | `state.json`: what the engine needs to restore windows after an abrupt exit. |
 | `diagnose.rs` | Applies and samples a window to measure whether the game reverts the change. |
-| `watcher.rs` | `SetWinEventHook`; the callback filters and posts. |
+| `watcher.rs` | `SetWinEventHook` on show, foreground and name change (plus per-process location hooks for managed windows); the callback filters and posts. |
 | `ipc/` | Protocol types and framing (`mod.rs`); named-pipe server and client (`pipe.rs`). |
 | `mcp.rs`, `cli.rs` | The two non-GUI clients of the pipe. |
 | `gui/` | GPUI views; pure geometry in `editor_model.rs` and `monitor_preview.rs`. |
@@ -70,6 +70,16 @@ one known place with exclusive access to the engine. For the same reason the win
 (`watcher.rs`) only filters and posts, and IPC requests reach the engine through a channel plus a posted
 message (`ipc_handler` in `tray.rs`). Delays (apply delay, settle, re-assert) are timers, not sleeps.
 
+**Window events.** Show and foreground post `WM_SHATTER_WINDOW` (`WM_APP + 1`); a title change
+(`EVENT_OBJECT_NAMECHANGE`) posts `WM_SHATTER_RENAMED` (`WM_APP + 6`), both only for visible top-level
+windows (`OBJID_WINDOW`, `CHILDID_SELF`). Each becomes an `Event` and `Engine::on_window`: a window that is
+not managed and not restored by the user gets its best-matching profile (`profiles::find`, by process and
+title) if that profile is enabled. A rename is ignored when no profile has a title rule (before the
+process is even looked up), and after a rename only a profile with a title rule counts, so
+process-only profiles behave as on show. A window whose automatic apply failed is not retried on its
+title changes, only on its next show or foreground (`auto_failed`). A managed window, including one
+waiting for its `delay_ms`, keeps its profile whatever its title becomes.
+
 ## IPC
 
 - **Pipe**: `\\.\pipe\BorderlessShatter-<SID>[-<suffix>]`, with the instance suffix when set (`pipe_name_for`,
@@ -77,7 +87,7 @@ message (`ipc_handler` in `tray.rs`). Delays (apply delay, settle, re-assert) ar
   remote clients are rejected, and the server's first instance uses `first_pipe_instance`, so a squatted
   pipe name is a hard error.
 - **Framing**: one JSON object per line, with unique keys at every level, at most `MAX_LINE` (1 MiB). Methods and payloads live in
-  `ipc/mod.rs`; `hello` returns `PROTOCOL` (2) and clients refuse a different value.
+  `ipc/mod.rs`; `hello` returns `PROTOCOL` (3) and clients refuse a different value.
 - **Errors**: `ErrorBody { code, message }`. Clients match `code`, never the English message; transport
   failures carry `os error N` instead of the localized OS text.
 - **Timeouts**: a client waits at most 70 s for one reply (`READ_TIMEOUT` = `max(MAX_DELAY_MS + PENDING_GRACE_MS, MAX_OBSERVE_MS)` + 6 s), which only bounds a resident
@@ -97,9 +107,9 @@ Reference for every client. All coordinates are physical pixels; hexadecimal sty
 **Strict decoding.** Applies to every request line and to MCP tool arguments.
 
 - A key repeated in any object of the line (envelope, `params`, nested at any depth, unknown fields included) is `invalid_params`. Keys are compared after JSON escapes are decoded. The response `id` is `0` when the repeated key is the top-level `id`; otherwise it is the request's `id`. A syntax error takes precedence: a broken line is `invalid_json`. The CLI's `profiles set` applies the same rule to its body file before sending (usage error, exit code 2).
-- An array where the schema expects an object (`window`, `offsets`, `game_resolution`, `rect`, and any other struct at any depth) is `invalid_params`. Arrays are accepted only where the method table shows a list (`remove`, `remove_layouts`, `profiles`, `layouts`, `islands`) and inside unknown or extra fields. `null` is accepted only where the field is nullable (`offsets`, `monitor`, `game_resolution`, `island`, `delay_ms`, `hwnd`, `process`, `title`, `profiles`, `layouts`, `remove`, `expected_revision`); elsewhere (`use_profile`, `observe_ms`, `keep`, `include_hidden`, `remove_layouts`, `replace_extras`, …) it is `invalid_params`. A whole `params` of `null` or absent means `{}`.
+- An array where the schema expects an object (`window`, `offsets`, `game_resolution`, `rect`, and any other struct at any depth) is `invalid_params`. Arrays are accepted only where the method table shows a list (`remove`, `remove_layouts`, `profiles`, `layouts`, `islands`) and inside unknown or extra fields. `null` is accepted only where the field is nullable (`offsets`, `monitor`, `game_resolution`, `island`, `delay_ms`, `hwnd`, `process`, `title`, `title_regex`, `profiles`, `layouts`, `remove`, `expected_revision`); elsewhere (`use_profile`, `observe_ms`, `keep`, `include_hidden`, `remove_layouts`, `replace_extras`, …) it is `invalid_params`. A whole `params` of `null` or absent means `{}`.
 - The same two rules apply to `profiles.json` when it is loaded: a repeated key, or an array where an object is expected, makes the file invalid (`profile_error`, naming the key or the JSON path). See the data files table. Values the schema ignores are still parsed strictly: a number that cannot be represented (`1e999`) or a lone surrogate (`"\ud800"`) anywhere in the file, unknown keys included, makes it invalid.
-- Unknown fields are still ignored. Every method, including `hello`, `restore_all`, `list_islands` and `get_profiles`, validates `params` this way: a non-object `params` is `invalid_params`.
+- Unknown fields are still ignored, except inside a `set_profiles` `remove` object: a field other than `process`, `title` and `title_regex` is `invalid_params` (ignoring a misspelt rule would select, and delete, the process-only profile). Every method, including `hello`, `restore_all`, `list_islands` and `get_profiles`, validates `params` this way: a non-object `params` is `invalid_params`.
 - Over MCP, the array rule is a tool error (`isError: true`, `failed to deserialize parameters: …`) and the call never reaches the resident. Repeated keys are not detected over MCP: rmcp collapses them before the tool sees `arguments`.
 - Responses are produced only by the engine, and clients decode them without this rigidity.
 
@@ -115,12 +125,12 @@ Reference for every client. All coordinates are physical pixels; hexadecimal sty
 | `restore_all` | none | `{restored: n, failed: [{hwnd, error}]}`; tries every window even when some fail. |
 | `list_islands` | none | `{monitors: [{index, device, rect, dpi, primary}], layouts: [{id, monitor, islands: [{id, rect, occupants: [hwnd]}]}]}`, rects resolved. |
 | `get_profiles` | none | `{path, revision, version, profiles, layouts, warnings}`. `revision` is the SHA-256 of the file bytes. |
-| `set_profiles` | `{profiles?, layouts?, remove?: [process], remove_layouts?: [id], expected_revision?}` | `{revision, warnings}`. Upserts by `process` / layout `id`, removes, validates, saves atomically. A stale `expected_revision` fails with `revision_conflict`. |
+| `set_profiles` | `{profiles?, layouts?, remove?: [process \| {process, title?, title_regex?}], remove_layouts?: [id], expected_revision?}` | `{revision, warnings}`. Upserts profiles by key (process file name, case-insensitive, plus `title` compared trimmed and case-insensitively, or `title_regex` as written) and layouts by `id`, removes, validates, saves atomically. A `remove` string deletes only that process's profile without a title rule; an object deletes the profile with that key. A stale `expected_revision` fails with `revision_conflict`. |
 | `diagnose` | `{window, island?, monitor?, observe_ms?=3000, keep?=false}` | `{hwnd, process, target, verdict, timeline: [{t_ms, source, op?, style, exstyle, rect}], final, forced_size?, revert_latency_ms: {style?, rect?}, dpi_awareness, recommendations: [{code, text, data?}], restored}`. Applies, samples, and restores unless `keep`. `source` is `us` or `window`; `verdict` is `accepted`, `style_reverted`, `size_forced`, `position_forced`, `style_and_size_reverted` or `late_revert`. `observe_ms` is clamped to 100–`MAX_OBSERVE_MS`, not rejected. |
 
-**Precedence.** Request parameters beat profile fields; inside a profile, `island` beats `monitor` and `offsets` (`set_profiles` rejects the combination with `island_overrides_monitor`). A profile's `game_resolution` places the window at that size centred in the island, clipped (with `game_resolution_exceeds_island`) if larger.
+**Precedence.** Request parameters beat profile fields; inside a profile, `island` beats `monitor` and `offsets` (`set_profiles` rejects the combination with `island_overrides_monitor`). A profile's `game_resolution` places the window at that size centred in the island, clipped (with `game_resolution_exceeds_island`) if larger. Among a process's profiles, the one for a window is the best match of its title: an exact `title`, then a `title_regex` (unanchored search), then the profile without a rule, ties in file order; a disabled winner leaves the window alone (`profiles::find`).
 
-**Warnings** (`{code, data}`, on `apply`/`place`): `size_forced`, `position_forced`, `style_reverted` (what was observed in the settle window), `game_resolution_exceeds_island`, and `fights_back` once the guard gave up. `get_profiles` and `set_profiles` warnings are validation codes: `island_overrides_monitor`, `bad_island_ref`, `island_not_found` (informational), `bad_game_resolution`, and for layouts `bad_layout_id`, `duplicate_layout`, `bad_island_id`, `duplicate_island`, `bad_island_rect`. All but `island_not_found` block the write; a rejected write is `profile_error` with `data.warnings`, and only warnings about what the call itself wrote count.
+**Warnings** (`{code, data}`, on `apply`/`place`): `size_forced`, `position_forced`, `style_reverted` (what was observed in the settle window), `game_resolution_exceeds_island`, and `fights_back` once the guard gave up. `get_profiles` and `set_profiles` warnings are validation codes: `island_overrides_monitor`, `bad_island_ref`, `island_not_found` (informational), `bad_game_resolution`, `bad_title` (empty after trimming), `bad_title_regex` (empty or does not compile), `title_rule_conflict` (`title` and `title_regex` together), `duplicate_profile` (informational: a second profile with the same key; the first wins), and for layouts `bad_layout_id`, `duplicate_layout`, `bad_island_id`, `duplicate_island`, `bad_island_rect`. A profile warning's `data` carries `process` and, when the profile has them, `title` or `title_regex`. All but `island_not_found` and `duplicate_profile` block the write; a rejected write is `profile_error` with `data.warnings`, and only warnings about what the call itself wrote count (profiles by key, layouts by `id`).
 
 **Error codes.** `error.code` is stable; `message` is English and not part of the contract; `data` is optional.
 
@@ -140,7 +150,7 @@ Reference for every client. All coordinates are physical pixels; hexadecimal sty
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `PROTOCOL` | 2 | Returned by `hello`. |
+| `PROTOCOL` | 3 | Returned by `hello`. |
 | `MAX_LINE` | 1 MiB | Longest JSON line; a longer one is drained to its newline and answered with `invalid_json`. |
 | `MAX_DELAY_MS` | 60 000 | Largest `delay_ms`, from a request or a profile. |
 | `MAX_OBSERVE_MS` | 15 000 | Largest `diagnose` observation. |
@@ -185,6 +195,7 @@ Things the code or its contributors depend on, with the reason in one line each.
 - **Placement, not reparenting.** Islands place a borderless top-level window in a rectangle; a `SetParent` container would put input and focus at risk and make the exact restore unreliable.
 - **Win event hooks, not polling.** They cost no CPU at rest, need no injection or administrator rights, and still see a game that puts its frame back later.
 - **Events and timers go to a message-only window.** Thread messages are lost while the tray menu runs its modal loop; the apply delay is a `SetTimer`, never a sleep.
+- **A managed window is not re-matched.** Its profile is fixed when it is captured; title changes are ignored until a restore, so games that toggle "Paused"/"Playing" or show FPS in the title do not flicker. Title regexes use the `regex` crate (linear-time search) with a 1 MiB compiled-size limit, and each pattern is compiled once per thread and cached, so a huge pattern in `profiles.json` is reported as `bad_title_regex` and never matches instead of costing a compile on every title change.
 - **Style masks.** Applying clears `0x00CF0000` from the style and `0x020E0381` from the ex-style, writes the styles first and the rect second, and always passes `SWP_FRAMECHANGED`; skipping the flag was never shown to be safe. The masks are observed facts about Win32, not code taken from another project.
 - **The guard decides by the target rect, not by frame bits.** A game that already has no frame (Unity with `-popupwindow`, style `0x94000000`) still needs placing, and a frame-bit test would skip it.
 - **Guard tuning comes from measured games.** Settle 600 ms (three times the slowest observed revert), at most 3 re-asserts per cycle after 50/150/400 ms (re-asserting right after a revert only provokes another), stop when the same forced rect repeats, at most 3 cycles per minute; after that the window is marked `fights_back` and left alone until an explicit `apply`.

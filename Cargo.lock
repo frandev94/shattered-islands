@@ -711,6 +711,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "proptest",
+ "regex",
  "rmcp",
  "schemars",
  "serde",

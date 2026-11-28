@@ -9,12 +9,15 @@
 //! ```
 //! use borderless_shatter::profiles::{find, parse, validate};
 //!
-//! let file = parse(r#"{"version":2,"profiles":[{"process":"Game.exe","island":"halves-16-9/left"}]}"#)
+//! let file = parse(r#"{"version":2,"profiles":[{"process":"Game.exe","island":"halves-16-9/left"},
+//!     {"process":"game.exe","title":"Launcher","enabled":false}]}"#)
 //!     .unwrap();
 //! assert!(validate(&file).is_empty());
 //! // Lookup compares the file name case-insensitively and ignores the directory.
-//! assert!(find(&file, r"C:\games\game.EXE").is_some());
-//! assert!(find(&file, "explorer.exe").is_none());
+//! assert!(find(&file.profiles, r"C:\games\game.EXE", "Game").unwrap().enabled);
+//! // A title rule beats the process-only profile; a disabled winner leaves the window alone.
+//! assert!(!find(&file.profiles, "game.exe", "launcher").unwrap().enabled);
+//! assert!(find(&file.profiles, "explorer.exe", "").is_none());
 //! ```
 
 use crate::window_state::Offsets;
@@ -108,6 +111,13 @@ fn default_true() -> bool {
 pub struct Profile {
     /// Process executable name; matched on the file name, case-insensitively.
     pub process: String,
+    /// Exact window title, compared trimmed and case-insensitively. Excludes `title_regex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Window title regular expression (`regex` crate syntax), searched anywhere in the title:
+    /// `^…$` for the whole title, `(?i)` to ignore case. Excludes `title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_regex: Option<String>,
     /// Disabled profiles are kept but not applied. Defaults to `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -239,16 +249,194 @@ pub fn is_excluded(process_name: &str) -> bool {
     EXCLUDED.iter().any(|e| e.eq_ignore_ascii_case(n))
 }
 
-/// The profile for `process_name` (name or path, case-insensitive), or `None` if none matches
-/// or the process is excluded.
-pub fn find<'a>(file: &'a ProfileFile, process_name: &str) -> Option<&'a Profile> {
+/// Trimmed and lowercased: how exact titles are compared, in matching and in [`ProfileKey`].
+fn norm_title(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// Compiled-size cap of a `title_regex` (the `regex` default is 10 MiB): a pattern over it fails
+/// to compile, so it is reported and never matches. 1 MiB still takes `^[\w ]{3,20}$` (256 KiB
+/// does not) and bounds the one-time compile to a few milliseconds.
+const REGEX_SIZE_LIMIT: usize = 1024 * 1024;
+/// Patterns kept compiled per thread; the cache starts over when it is full.
+const REGEX_CACHE_MAX: usize = 64;
+
+thread_local! {
+    static REGEXES: std::cell::RefCell<std::collections::HashMap<String, Option<regex::Regex>>> =
+        Default::default();
+}
+
+/// `pattern` compiled under [`REGEX_SIZE_LIMIT`], once per thread; `None` if it is empty or does
+/// not compile.
+fn compiled(pattern: &str) -> Option<regex::Regex> {
+    if pattern.is_empty() {
+        return None;
+    }
+    REGEXES.with_borrow_mut(|cache| {
+        if let Some(re) = cache.get(pattern) {
+            return re.clone();
+        }
+        if cache.len() >= REGEX_CACHE_MAX {
+            cache.clear();
+        }
+        let re = regex::RegexBuilder::new(pattern)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .build()
+            .ok();
+        cache.insert(pattern.to_owned(), re.clone());
+        re
+    })
+}
+
+/// Whether `pattern` is a usable `title_regex`: not empty, compiles, and within the 1 MiB
+/// compiled-size limit.
+///
+/// ```
+/// assert!(borderless_shatter::profiles::title_regex_ok("^Game \\d+$"));
+/// assert!(!borderless_shatter::profiles::title_regex_ok("(oops"));
+/// ```
+pub fn title_regex_ok(pattern: &str) -> bool {
+    compiled(pattern).is_some()
+}
+
+/// Precedence of `p` for a window titled `title`: 0 exact title, 1 regex, 2 process only; `None`
+/// when its rule does not match or is invalid (empty, broken regex, both rules).
+fn rank(p: &Profile, title: &str) -> Option<u8> {
+    match (&p.title, &p.title_regex) {
+        (None, None) => Some(2),
+        (Some(t), None) => {
+            (!t.trim().is_empty() && norm_title(t) == norm_title(title)).then_some(0)
+        }
+        (None, Some(r)) => compiled(r)
+            .is_some_and(|re| re.is_match(title))
+            .then_some(1),
+        (Some(_), Some(_)) => None,
+    }
+}
+
+/// The best profile for a window of `process_name` (name or path, case-insensitive) titled
+/// `title`: among the process's profiles whose rule matches, an exact `title` beats a
+/// `title_regex`, which beats a process-only profile; ties go to file order. Disabled profiles
+/// compete too (a disabled winner means "leave the window alone"). `None` if none matches or the
+/// process is excluded.
+pub fn find<'a>(profiles: &'a [Profile], process_name: &str, title: &str) -> Option<&'a Profile> {
     let n = file_name(process_name);
     if is_excluded(n) {
         return None;
     }
-    file.profiles
+    profiles
         .iter()
-        .find(|p| file_name(&p.process).eq_ignore_ascii_case(n))
+        .filter(|p| file_name(&p.process).eq_ignore_ascii_case(n))
+        .filter_map(|p| rank(p, title).map(|r| (r, p)))
+        .min_by_key(|&(r, _)| r)
+        .map(|(_, p)| p)
+}
+
+/// Identity of a profile: upsert, remove and duplicate checks go by it. Built normalized by
+/// [`ProfileKey::new`] / [`ProfileKey::of`] (the process file name lowercased, `title` trimmed and
+/// lowercased, `title_regex` as is), so `==` is the identity; build it with those, not a literal.
+/// JSON: a process name (the process-only key) or `{process, title?, title_regex?}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "KeyRepr", into = "KeyRepr")]
+pub struct ProfileKey {
+    /// Process file name, lowercased.
+    pub process: String,
+    /// Exact title rule, trimmed and lowercased.
+    pub title: Option<String>,
+    /// Regex title rule, as written.
+    pub title_regex: Option<String>,
+}
+
+impl ProfileKey {
+    /// The normalized key of a profile with these fields.
+    pub fn new(process: &str, title: Option<&str>, title_regex: Option<&str>) -> Self {
+        ProfileKey {
+            process: file_name(process).to_ascii_lowercase(),
+            title: title.map(norm_title),
+            title_regex: title_regex.map(str::to_owned),
+        }
+    }
+
+    /// The key of `p`.
+    pub fn of(p: &Profile) -> Self {
+        Self::new(&p.process, p.title.as_deref(), p.title_regex.as_deref())
+    }
+}
+
+impl From<&str> for ProfileKey {
+    /// The process-only key of `process`.
+    fn from(process: &str) -> Self {
+        Self::new(process, None, None)
+    }
+}
+
+/// Wire form of [`ProfileKey`].
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum KeyRepr {
+    /// A process name: its process-only profile.
+    Process(String),
+    /// One profile by process and title rule.
+    Rule(RuleRepr),
+}
+
+/// One profile by process and title rule. A misspelt field is an error: ignoring it would turn
+/// the key into the process-only one, and a `remove` would delete that profile.
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RuleRepr {
+    /// Process executable name.
+    process: String,
+    /// Exact title rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Regex title rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_regex: Option<String>,
+}
+
+impl From<KeyRepr> for ProfileKey {
+    fn from(r: KeyRepr) -> Self {
+        match r {
+            KeyRepr::Process(p) => Self::new(&p, None, None),
+            KeyRepr::Rule(RuleRepr {
+                process,
+                title,
+                title_regex,
+            }) => Self::new(&process, title.as_deref(), title_regex.as_deref()),
+        }
+    }
+}
+
+impl From<ProfileKey> for KeyRepr {
+    fn from(k: ProfileKey) -> Self {
+        match k {
+            ProfileKey {
+                process,
+                title: None,
+                title_regex: None,
+            } => KeyRepr::Process(process),
+            ProfileKey {
+                process,
+                title,
+                title_regex,
+            } => KeyRepr::Rule(RuleRepr {
+                process,
+                title,
+                title_regex,
+            }),
+        }
+    }
+}
+
+impl JsonSchema for ProfileKey {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ProfileKey".into()
+    }
+
+    fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        KeyRepr::json_schema(g)
+    }
 }
 
 /// Lowercase hex SHA-256 of the raw file bytes.
@@ -289,24 +477,51 @@ fn warn(code: &str, data: serde_json::Value) -> Warning {
 pub fn validate(file: &ProfileFile) -> Vec<Warning> {
     let layouts = crate::islands::merged_layouts(&file.layouts);
     let mut out = Vec::new();
+    let mut keys = std::collections::HashSet::new();
     for p in &file.profiles {
-        let process = &p.process;
+        // `process`, plus the title rule when the profile has one.
+        let data = |more: serde_json::Value| {
+            let mut d = serde_json::json!({ "process": p.process });
+            if let Some(t) = &p.title {
+                d["title"] = t.as_str().into();
+            }
+            if let Some(r) = &p.title_regex {
+                d["title_regex"] = r.as_str().into();
+            }
+            if let (Some(d), serde_json::Value::Object(more)) = (d.as_object_mut(), more) {
+                d.extend(more);
+            }
+            d
+        };
+        let none = || serde_json::json!({});
+        if !keys.insert(ProfileKey::of(p)) {
+            out.push(warn("duplicate_profile", data(none())));
+        }
+        if p.title.as_ref().is_some_and(|t| t.trim().is_empty()) {
+            out.push(warn("bad_title", data(none())));
+        }
+        if p.title_regex.as_ref().is_some_and(|r| !title_regex_ok(r)) {
+            out.push(warn("bad_title_regex", data(none())));
+        }
+        if p.title.is_some() && p.title_regex.is_some() {
+            out.push(warn("title_rule_conflict", data(none())));
+        }
         if let Some(r) = &p.island {
             if p.monitor != MonitorChoice::Current || p.offsets != Offsets::default() {
                 out.push(warn(
                     "island_overrides_monitor",
-                    serde_json::json!({ "process": process, "island": r }),
+                    data(serde_json::json!({ "island": r })),
                 ));
             }
             match crate::islands::find_island(&layouts, r) {
                 Ok(_) => {}
                 Err(crate::islands::IslandError::BadRef(_)) => out.push(warn(
                     "bad_island_ref",
-                    serde_json::json!({ "process": process, "island": r }),
+                    data(serde_json::json!({ "island": r })),
                 )),
                 Err(_) => out.push(warn(
                     "island_not_found",
-                    serde_json::json!({ "process": process, "island": r }),
+                    data(serde_json::json!({ "island": r })),
                 )),
             }
         }
@@ -315,7 +530,7 @@ pub fn validate(file: &ProfileFile) -> Vec<Warning> {
         {
             out.push(warn(
                 "bad_game_resolution",
-                serde_json::json!({ "process": process, "width": s.width, "height": s.height }),
+                data(serde_json::json!({ "width": s.width, "height": s.height })),
             ));
         }
     }
@@ -372,14 +587,17 @@ fn validate_layouts(layouts: &[crate::islands::Layout], out: &mut Vec<Warning>) 
 
 /// Whether a [`Warning::code`] is blocking.
 ///
-/// Codes that make `set_profiles` reject the write (layout codes always; process codes only for
-/// processes the call wrote).
+/// Codes that make `set_profiles` reject the write (layout codes always; profile codes only for
+/// profile keys the call wrote). `island_not_found` and `duplicate_profile` are informational.
 pub fn is_blocking(code: &str) -> bool {
     matches!(
         code,
         "island_overrides_monitor"
             | "bad_island_ref"
             | "bad_game_resolution"
+            | "bad_title"
+            | "bad_title_regex"
+            | "title_rule_conflict"
             | "bad_layout_id"
             | "duplicate_layout"
             | "bad_island_id"
@@ -388,7 +606,9 @@ pub fn is_blocking(code: &str) -> bool {
     )
 }
 
-/// Upsert by `process` (case-insensitive file name) / layout `id`, then drop `remove` / `remove_layouts`.
+/// Upsert by [`ProfileKey`] (the first profile with the same key is replaced) / layout `id`, then
+/// drop every profile whose key is in `remove` and the layouts in `remove_layouts`. A process-only
+/// key leaves the title-rule profiles of that process alone.
 /// With `replace_extras` false:
 /// - A replaced profile or layout that has no unknown keys (`extra`) keeps the replaced item's keys.
 /// - Each island of a replaced layout does the same, matched by `id` inside the replaced layout.
@@ -400,24 +620,23 @@ pub fn is_blocking(code: &str) -> bool {
 /// ```
 /// use borderless_shatter::profiles::{parse, upsert};
 ///
-/// let mut f = parse(r#"{"version":2,"profiles":[{"process":"a.exe"}]}"#).unwrap();
+/// let mut f = parse(r#"{"version":2,"profiles":[{"process":"a.exe"},{"process":"a.exe","title":"T"}]}"#)
+///     .unwrap();
 /// upsert(&mut f, vec![], vec![], vec!["A.EXE".into()], vec![], false);
-/// assert!(f.profiles.is_empty());
+/// assert_eq!(f.profiles.len(), 1);
+/// assert_eq!(f.profiles[0].title.as_deref(), Some("T"));
 /// ```
 pub fn upsert(
     file: &mut ProfileFile,
     profiles: Vec<Profile>,
     layouts: Vec<crate::islands::Layout>,
-    remove: Vec<String>,
+    remove: Vec<ProfileKey>,
     remove_layouts: Vec<String>,
     replace_extras: bool,
 ) {
     for p in profiles {
-        match file
-            .profiles
-            .iter_mut()
-            .find(|x| file_name(&x.process).eq_ignore_ascii_case(file_name(&p.process)))
-        {
+        let key = ProfileKey::of(&p);
+        match file.profiles.iter_mut().find(|x| ProfileKey::of(x) == key) {
             Some(slot) => {
                 let old = std::mem::replace(slot, p);
                 if slot.extra.is_empty() && !replace_extras {
@@ -445,11 +664,10 @@ pub fn upsert(
             None => file.layouts.push(l),
         }
     }
-    file.profiles.retain(|p| {
-        !remove
-            .iter()
-            .any(|r| file_name(&p.process).eq_ignore_ascii_case(file_name(r)))
-    });
+    if !remove.is_empty() {
+        file.profiles
+            .retain(|p| !remove.contains(&ProfileKey::of(p)));
+    }
     file.layouts.retain(|l| !remove_layouts.contains(&l.id));
 }
 
@@ -594,8 +812,304 @@ mod tests {
             r#"{"version":1,"profiles":[{"process":"game.exe"},{"process":"explorer.exe"}]}"#,
         )
         .unwrap();
-        assert!(find(&f, "C:\\Games\\GAME.EXE").is_some());
-        assert!(find(&f, "explorer.exe").is_none());
+        assert!(find(&f.profiles, "C:\\Games\\GAME.EXE", "").is_some());
+        assert!(find(&f.profiles, "explorer.exe", "").is_none());
+    }
+
+    fn profiles_of(json: &str) -> Vec<Profile> {
+        parse(&format!(r#"{{"version":2,"profiles":{json}}}"#))
+            .unwrap()
+            .profiles
+    }
+
+    #[test]
+    fn find_exact_title_ignores_case_and_outer_spaces() {
+        let ps = profiles_of(r#"[{"process":"g.exe","title":"  Main Window "}]"#);
+        assert!(find(&ps, "g.exe", "main window").is_some());
+        assert!(find(&ps, "g.exe", " MAIN WINDOW\t").is_some());
+        assert!(find(&ps, "g.exe", "Main Window 2").is_none());
+        assert!(find(&ps, "other.exe", "Main Window").is_none());
+    }
+
+    #[test]
+    fn find_regex_is_unanchored() {
+        let ps = profiles_of(r#"[{"process":"g.exe","title_regex":"Lev\\d"}]"#);
+        assert!(find(&ps, "g.exe", "Game - Lev3 - 60 FPS").is_some());
+        assert!(find(&ps, "g.exe", "game - lev3").is_none());
+        let anchored = profiles_of(r#"[{"process":"g.exe","title_regex":"(?i)^lev\\d$"}]"#);
+        assert!(find(&anchored, "g.exe", "LEV3").is_some());
+        assert!(find(&anchored, "g.exe", "x LEV3").is_none());
+    }
+
+    #[test]
+    fn find_invalid_or_empty_rule_never_matches() {
+        for rule in [
+            r#""title_regex":"(""#,
+            r#""title_regex":"""#,
+            r#""title":"  ""#,
+            r#""title":"x","title_regex":"x""#,
+        ] {
+            let ps = profiles_of(&format!(r#"[{{"process":"g.exe",{rule}}}]"#));
+            for title in ["", "  ", "x", "("] {
+                assert!(find(&ps, "g.exe", title).is_none(), "{rule} {title:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_excluded_process_ignores_title_rules() {
+        let ps = profiles_of(
+            r#"[{"process":"explorer.exe","title":"Desktop"},{"process":"explorer.exe","title_regex":"."}]"#,
+        );
+        assert!(find(&ps, "C:\\Windows\\explorer.exe", "Desktop").is_none());
+    }
+
+    #[test]
+    fn find_precedence_exact_then_regex_then_process_then_file_order() {
+        let ps = profiles_of(
+            r#"[{"process":"g.exe","delay_ms":1},
+                {"process":"g.exe","title_regex":"^Ga","delay_ms":2},
+                {"process":"g.exe","title_regex":"me$","delay_ms":3},
+                {"process":"g.exe","title":"game","delay_ms":4},
+                {"process":"g.exe","title":"GAME","delay_ms":5}]"#,
+        );
+        let delay = |title: &str| find(&ps, "g.exe", title).map(|p| p.delay_ms);
+        assert_eq!(delay("Game"), Some(4));
+        assert_eq!(delay("Gallery"), Some(2));
+        assert_eq!(delay("Frame"), Some(3));
+        assert_eq!(delay("Launcher"), Some(1));
+    }
+
+    #[test]
+    fn find_disabled_best_match_shadows_the_process_profile() {
+        let ps = profiles_of(
+            r#"[{"process":"g.exe"},{"process":"g.exe","title":"Launcher","enabled":false}]"#,
+        );
+        assert!(!find(&ps, "g.exe", "launcher").unwrap().enabled);
+        assert!(find(&ps, "g.exe", "Game").unwrap().enabled);
+    }
+
+    #[test]
+    fn title_regex_ok_rejects_empty_and_broken() {
+        assert!(title_regex_ok("^Game \\d+$"));
+        assert!(!title_regex_ok(""));
+        assert!(!title_regex_ok("(unclosed"));
+    }
+
+    #[test]
+    fn a_title_regex_too_big_to_compile_cheaply_is_rejected_and_never_matches() {
+        // Fits the regex crate's default size limit, not ours.
+        let huge = r"\w{50}";
+        assert!(!title_regex_ok(huge));
+        let ps = profiles_of(r#"[{"process":"g.exe","title_regex":"\\w{50}"}]"#);
+        assert!(find(&ps, "g.exe", &"a".repeat(60)).is_none());
+        // Ordinary patterns still compile.
+        assert!(title_regex_ok(r"(?i)^.*game - level \d+ .*$"));
+        assert!(title_regex_ok(r"^[\w ]{3,20}$"));
+    }
+
+    #[test]
+    fn profile_key_object_rejects_unknown_fields() {
+        // A misspelt rule must not fall back to the process-only key (a remove would delete it).
+        for bad in [
+            r#"{"process":"a.exe","titel":"Menu"}"#,
+            r#"{"process":"a.exe","Title":"Menu"}"#,
+            r#"{"process":"a.exe","regex":"^M"}"#,
+        ] {
+            assert!(serde_json::from_str::<ProfileKey>(bad).is_err(), "{bad}");
+        }
+        let schema = schemars::SchemaGenerator::default().into_root_schema_for::<ProfileKey>();
+        let text = schema.as_value().to_string();
+        assert!(text.contains(r#""additionalProperties":false"#), "{text}");
+    }
+
+    #[test]
+    fn profile_without_rule_serializes_as_before() {
+        let text = r#"{"process":"a.exe","enabled":true,"monitor":"current","offsets":{"left":0,"top":0,"right":0,"bottom":0},"delay_ms":0,"clip_cursor":false}"#;
+        let p: Profile = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_string(&p).unwrap(), text);
+        let ruled = profiles_of(
+            r#"[{"process":"a.exe","title":"T"},{"process":"b.exe","title_regex":"R"}]"#,
+        );
+        assert_eq!(ruled[0].title.as_deref(), Some("T"));
+        assert_eq!(ruled[1].title_regex.as_deref(), Some("R"));
+        assert!(ruled[0].extra.is_empty() && ruled[1].extra.is_empty());
+    }
+
+    #[test]
+    fn profile_key_normalizes_process_and_title_but_not_regex() {
+        let ps = profiles_of(
+            r#"[{"process":"C:\\G\\Game.EXE","title":" Main "},{"process":"g.exe","title_regex":"A"}]"#,
+        );
+        assert_eq!(
+            ProfileKey::of(&ps[0]),
+            ProfileKey::new("game.exe", Some("main"), None)
+        );
+        assert_ne!(
+            ProfileKey::of(&ps[1]),
+            ProfileKey::new("g.exe", None, Some("a"))
+        );
+        let keys: Vec<ProfileKey> = serde_json::from_str(
+            r#"["GAME.exe",{"process":"game.exe","title":"MAIN"},{"process":"g.exe","title_regex":"A","title":null}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            keys,
+            [
+                ProfileKey::new("game.exe", None, None),
+                ProfileKey::of(&ps[0]),
+                ProfileKey::of(&ps[1]),
+            ]
+        );
+        assert!(serde_json::from_str::<ProfileKey>("1").is_err());
+        assert!(serde_json::from_str::<ProfileKey>(r#"{"title":"x"}"#).is_err());
+        assert_eq!(serde_json::to_string(&keys[0]).unwrap(), r#""game.exe""#);
+    }
+
+    fn codes_and_data(json: &str) -> Vec<(String, serde_json::Value)> {
+        let f = parse(&format!(r#"{{"version":2,"profiles":{json}}}"#)).unwrap();
+        validate(&f).into_iter().map(|w| (w.code, w.data)).collect()
+    }
+
+    #[test]
+    fn validate_title_rules() {
+        use serde_json::json;
+        assert_eq!(
+            codes_and_data(
+                r#"[{"process":"a.exe","title":" "},
+                    {"process":"b.exe","title_regex":"("},
+                    {"process":"c.exe","title_regex":""},
+                    {"process":"d.exe","title":"x","title_regex":"y"}]"#
+            ),
+            [
+                (
+                    "bad_title".into(),
+                    json!({"process": "a.exe", "title": " "})
+                ),
+                (
+                    "bad_title_regex".into(),
+                    json!({"process": "b.exe", "title_regex": "("})
+                ),
+                (
+                    "bad_title_regex".into(),
+                    json!({"process": "c.exe", "title_regex": ""})
+                ),
+                (
+                    "title_rule_conflict".into(),
+                    json!({"process": "d.exe", "title": "x", "title_regex": "y"})
+                ),
+            ]
+        );
+        for code in ["bad_title", "bad_title_regex", "title_rule_conflict"] {
+            assert!(is_blocking(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn validate_flags_duplicate_keys_as_informational() {
+        use serde_json::json;
+        assert_eq!(
+            codes_and_data(
+                r#"[{"process":"a.exe"},{"process":"a.exe","title":"T"},{"process":"A.EXE"},
+                    {"process":"a.exe","title":" t "},{"process":"a.exe","title_regex":"T"},
+                    {"process":"a.exe","title_regex":"t"}]"#
+            ),
+            [
+                ("duplicate_profile".into(), json!({"process": "A.EXE"})),
+                (
+                    "duplicate_profile".into(),
+                    json!({"process": "a.exe", "title": " t "})
+                ),
+            ]
+        );
+        assert!(!is_blocking("duplicate_profile"));
+    }
+
+    #[test]
+    fn profile_warnings_carry_the_rule() {
+        use serde_json::json;
+        assert_eq!(
+            codes_and_data(r#"[{"process":"a.exe","title":"T","island":"nope/x"}]"#),
+            [(
+                "island_not_found".into(),
+                json!({"process": "a.exe", "title": "T", "island": "nope/x"})
+            )]
+        );
+    }
+
+    #[test]
+    fn upsert_by_key_keeps_other_rules_of_the_process() {
+        let mut f = parse(
+            r#"{"version":2,"profiles":[{"process":"a.exe","delay_ms":1},{"process":"a.exe","title":"T","delay_ms":2}]}"#,
+        )
+        .unwrap();
+        let sent = profiles_of(
+            r#"[{"process":"A.exe","title":" t ","delay_ms":3},{"process":"a.exe","title_regex":"R","delay_ms":4}]"#,
+        );
+        upsert(&mut f, sent, vec![], vec![], vec![], false);
+        let got: Vec<_> = f
+            .profiles
+            .iter()
+            .map(|p| (p.title.as_deref(), p.title_regex.as_deref(), p.delay_ms))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (None, None, 1),
+                (Some(" t "), None, 3),
+                (None, Some("R"), 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_string_deletes_only_the_process_only_profile() {
+        let mut f = parse(
+            r#"{"version":2,"profiles":[{"process":"a.exe"},{"process":"a.exe","title":"T"},
+              {"process":"a.exe","title_regex":"R"},{"process":"A.EXE"},{"process":"b.exe"}]}"#,
+        )
+        .unwrap();
+        let remove: Vec<ProfileKey> = serde_json::from_str(r#"["C:\\x\\a.exe"]"#).unwrap();
+        upsert(&mut f, vec![], vec![], remove, vec![], false);
+        let left: Vec<_> = f
+            .profiles
+            .iter()
+            .map(|p| {
+                (
+                    p.process.as_str(),
+                    p.title.is_some(),
+                    p.title_regex.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            left,
+            [
+                ("a.exe", true, false),
+                ("a.exe", false, true),
+                ("b.exe", false, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_object_deletes_that_profile() {
+        let mut f = parse(
+            r#"{"version":2,"profiles":[{"process":"a.exe"},{"process":"a.exe","title":"T"},
+              {"process":"a.exe","title_regex":"R"},{"process":"a.exe","title_regex":"r"}]}"#,
+        )
+        .unwrap();
+        let remove: Vec<ProfileKey> = serde_json::from_str(
+            r#"[{"process":"A.EXE","title":"t"},{"process":"a.exe","title_regex":"r"}]"#,
+        )
+        .unwrap();
+        upsert(&mut f, vec![], vec![], remove, vec![], false);
+        let left: Vec<_> = f
+            .profiles
+            .iter()
+            .map(|p| (p.title.as_deref(), p.title_regex.as_deref()))
+            .collect();
+        assert_eq!(left, [(None, None), (None, Some("R"))]);
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {

@@ -570,7 +570,14 @@ impl App {
                 |t, _, ev: &diagnose_view::UseGameResolution, window, cx| {
                     t.section = Section::Profiles;
                     t.profiles.update(cx, |v, cx| {
-                        v.prefill_resolution(&ev.process, ev.width, ev.height, window, cx)
+                        v.prefill_resolution(
+                            &ev.process,
+                            ev.title.as_deref(),
+                            ev.width,
+                            ev.height,
+                            window,
+                            cx,
+                        )
                     });
                     cx.notify();
                 },

@@ -29,7 +29,7 @@ use crate::ipc::{
     SetProfilesResult, TimelineEntry, TimelineSource, WindowInfo, WindowMonitor, WindowRef,
 };
 use crate::islands::{self, IslandError, Layout, MonitorSel, Size};
-use crate::profiles::{self, ProfileError, ProfileFile, Warning};
+use crate::profiles::{self, Profile, ProfileError, ProfileFile, ProfileKey, Warning};
 use crate::state_store::{StateStore, StoredEntry};
 use crate::watcher;
 use crate::win32::{self, HWND, ShowCmd, Win32Error};
@@ -59,6 +59,8 @@ const MAX_COORD: i32 = 1_000_000;
 /// What the message window's procedure hands to the main loop.
 enum Event {
     Window(isize),
+    /// A top-level window's title changed (`EVENT_OBJECT_NAMECHANGE`).
+    Renamed(isize),
     Changed(isize),
     MoveSize(isize, bool),
     Tick,
@@ -85,6 +87,7 @@ pub unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     let event = match msg {
         watcher::WM_SHATTER_WINDOW => Event::Window(wparam.0 as isize),
+        watcher::WM_SHATTER_RENAMED => Event::Renamed(wparam.0 as isize),
         watcher::WM_SHATTER_CHANGED => Event::Changed(wparam.0 as isize),
         watcher::WM_SHATTER_MOVESIZE => Event::MoveSize(wparam.0 as isize, lparam.0 != 0),
         WM_TIMER if wparam.0 == TIMER_TICK => Event::Tick,
@@ -315,6 +318,56 @@ fn auto_candidate(h: HWND) -> bool {
     })
 }
 
+/// The profile the automatic path applies to an unmanaged window of `name` titled `title`: the
+/// best match, if enabled. After a rename only a title-rule match counts, so process-only
+/// profiles behave as on show (see [`rename_worth_matching`] for the cheap checks first).
+fn auto_profile<'a>(
+    profiles: &'a [Profile],
+    name: &str,
+    title: &str,
+    renamed: bool,
+) -> Option<&'a Profile> {
+    profiles::find(profiles, name, title)
+        .filter(|p| p.enabled && (!renamed || p.title.is_some() || p.title_regex.is_some()))
+}
+
+/// Whether a title change of an unmanaged window is worth matching: some profile has a title
+/// rule (otherwise the result cannot change), and the window's automatic apply has not already
+/// failed (a game that shows its frame rate in the title would retry it on every frame).
+fn rename_worth_matching(profiles: &[Profile], failed_before: bool) -> bool {
+    !failed_before
+        && profiles
+            .iter()
+            .any(|p| p.title.is_some() || p.title_regex.is_some())
+}
+
+/// The profile tray "Apply: `process`" uses for a window of `name` titled `title`: its best
+/// match, if that is an enabled profile of `process` (a disabled winner excludes the window).
+fn tray_profile<'a>(
+    profiles: &'a [Profile],
+    name: &str,
+    title: &str,
+    process: &str,
+) -> Option<&'a Profile> {
+    profiles::find(profiles, name, title)
+        .filter(|p| p.enabled && base_name(&p.process).eq_ignore_ascii_case(base_name(process)))
+}
+
+/// The automatic path's plan for a window that matched `p`.
+fn auto_plan(p: &Profile) -> Result<Plan, ErrorBody> {
+    build_plan(
+        Some(p),
+        PlanReq {
+            island: None,
+            monitor: None,
+            offsets: None,
+            delay_ms: None,
+            use_profile: true,
+            game_resolution: None,
+        },
+    )
+}
+
 /// Saves `entries`. A state file `readopt` could not read (`unreadable`) is first moved to
 /// `<file>.bad`, replacing an older bad copy, so its restore data is never overwritten; while
 /// that move fails nothing is written.
@@ -430,9 +483,9 @@ fn offsets_in_range(o: &Offsets) -> bool {
         .all(|v| (-MAX_COORD..=MAX_COORD).contains(v))
 }
 
-/// Request fields override profile fields; a profile's `island` overrides its monitor/offsets.
-/// Pure: the caller supplies the process name and the profile file.
-fn build_plan(file: &ProfileFile, name: &str, req: PlanReq) -> Result<Plan, ErrorBody> {
+/// Request fields override fields of `prof` (the window's profile, already chosen by the caller);
+/// a profile's `island` overrides its monitor/offsets. Pure.
+fn build_plan(prof: Option<&Profile>, req: PlanReq) -> Result<Plan, ErrorBody> {
     if req.delay_ms.is_some_and(|d| d > MAX_DELAY_MS) {
         return Err(err(
             ErrorCode::InvalidParams,
@@ -445,11 +498,7 @@ fn build_plan(file: &ProfileFile, name: &str, req: PlanReq) -> Result<Plan, Erro
             format!("offsets out of range (±{MAX_COORD})"),
         ));
     }
-    let prof = if req.use_profile {
-        profiles::find(file, name)
-    } else {
-        None
-    };
+    let prof = prof.filter(|_| req.use_profile);
     if let Some(p) = prof
         && !offsets_in_range(&p.offsets)
     {
@@ -518,6 +567,8 @@ pub struct Engine {
     diags: Vec<Diag>,
     /// Windows the user restored; automatic handling skips them until an explicit apply.
     user_restored: HashSet<isize>,
+    /// Windows whose automatic apply failed: their title changes are not retried.
+    auto_failed: HashSet<isize>,
     /// Last foreground window that is not ours: the tray menu steals the foreground while open.
     last_foreground: isize,
     tick_armed: bool,
@@ -564,6 +615,7 @@ impl Engine {
             managed: HashMap::new(),
             diags: Vec::new(),
             user_restored: HashSet::new(),
+            auto_failed: HashSet::new(),
             last_foreground: 0,
             tick_armed: false,
             status,
@@ -610,7 +662,7 @@ impl Engine {
             self.last_foreground = win32::hwnd_to_isize(fg);
         }
         for h in watcher::initial_scan() {
-            self.on_window(h);
+            self.on_window(h, false);
         }
     }
 
@@ -720,20 +772,25 @@ impl Engine {
 
     // -------------------------------------------------------------- tray API
 
-    /// Tray "Apply": same matching as the automatic path (exclusions, path-style names), but
-    /// ignores `enabled` and any earlier manual restore.
+    /// Tray "Apply": same matching as the automatic path (exclusions, path-style names, title
+    /// rules), but ignores `enabled` and any earlier manual restore. Applies to the windows whose
+    /// best match is a profile of `process`.
     pub fn apply_process(&mut self, process: &str) {
         for h in watcher::initial_scan() {
             let Ok(name) = win32::process_name_of(h) else {
                 continue;
             };
-            if profiles::find(&self.profiles, &name)
-                .is_none_or(|p| !p.process.eq_ignore_ascii_case(process))
-            {
+            let Some(p) = tray_profile(
+                &self.profiles.profiles,
+                &name,
+                &win32::window_title(h),
+                process,
+            ) else {
                 continue;
-            }
+            };
+            let plan = auto_plan(p);
             self.user_restored.remove(&win32::hwnd_to_isize(h));
-            self.apply_auto(h);
+            self.apply_auto(h, plan);
         }
     }
 
@@ -792,7 +849,8 @@ impl Engine {
     pub fn drain(&mut self) {
         for event in EVENTS.with_borrow_mut(std::mem::take) {
             match event {
-                Event::Window(raw) => self.on_window(win32::hwnd_from_isize(raw)),
+                Event::Window(raw) => self.on_window(win32::hwnd_from_isize(raw), false),
+                Event::Renamed(raw) => self.on_window(win32::hwnd_from_isize(raw), true),
                 Event::Changed(raw) => self.on_changed(raw),
                 Event::MoveSize(raw, start) => {
                     if let Some(m) = self.managed.get_mut(&raw) {
@@ -812,8 +870,11 @@ impl Engine {
         self.sync_timer();
     }
 
-    /// Show/foreground event: applies the matching profile, skipping managed and user-restored windows.
-    fn on_window(&mut self, h: HWND) {
+    /// Show/foreground (`renamed` false) or title change (`renamed` true) of a top-level window:
+    /// applies its profile (see [`auto_profile`]), skipping managed and user-restored windows. A
+    /// managed window keeps its profile whatever its title becomes. A window whose automatic
+    /// apply failed is retried on its next show or foreground, never on a rename.
+    fn on_window(&mut self, h: HWND, renamed: bool) {
         if !win32::is_window(h) {
             return;
         }
@@ -831,31 +892,43 @@ impl Engine {
                 return;
             }
         }
+        if !self.auto_failed.is_empty() {
+            self.auto_failed
+                .retain(|&r| win32::is_window(win32::hwnd_from_isize(r)));
+        }
+        if renamed {
+            // Before `process_name_of`: renames of any window arrive here.
+            if !rename_worth_matching(&self.profiles.profiles, self.auto_failed.contains(&raw)) {
+                return;
+            }
+        } else {
+            self.auto_failed.remove(&raw);
+        }
         let Ok(name) = win32::process_name_of(h) else {
             return;
         };
-        if profiles::find(&self.profiles, &name).is_none_or(|p| !p.enabled) || !auto_candidate(h) {
+        let Some(p) = auto_profile(
+            &self.profiles.profiles,
+            &name,
+            &win32::window_title(h),
+            renamed,
+        ) else {
             return;
+        };
+        let plan = auto_plan(p);
+        if auto_candidate(h) {
+            self.apply_auto(h, plan);
         }
-        self.apply_auto(h);
     }
 
-    /// Applies the window's profile with no reply to send; failures go to the tray status.
-    fn apply_auto(&mut self, h: HWND) {
-        let req = PlanReq {
-            island: None,
-            monitor: None,
-            offsets: None,
-            delay_ms: None,
-            use_profile: true,
-            game_resolution: None,
-        };
-        let res = self
-            .plan_for(h, req)
-            .and_then(|plan| self.apply_window(h, &plan, &mut None));
+    /// Applies `plan` (from the profile the caller matched) with no reply to send; failures go to
+    /// the tray status and are remembered in `auto_failed`.
+    fn apply_auto(&mut self, h: HWND, plan: Result<Plan, ErrorBody>) {
+        let res = plan.and_then(|plan| self.apply_window(h, &plan, &mut None));
         if let Err(e) = res
             && e.code != ErrorCode::Busy
         {
+            self.auto_failed.insert(win32::hwnd_to_isize(h));
             self.note(e.message);
         }
     }
@@ -1124,7 +1197,8 @@ impl Engine {
     /// Request fields override profile fields; a profile's `island` overrides its monitor/offsets.
     fn plan_for(&self, h: HWND, req: PlanReq) -> Result<Plan, ErrorBody> {
         let name = win32::process_name_of(h).map_err(|e| w32(&e, win32::window_pid(h)))?;
-        build_plan(&self.profiles, &name, req)
+        let prof = profiles::find(&self.profiles.profiles, &name, &win32::window_title(h));
+        build_plan(prof, req)
     }
 
     fn resolve_target(&self, h: HWND, plan: &Plan) -> Result<(Rect, Vec<Warning>), ErrorBody> {
@@ -1929,12 +2003,8 @@ impl Engine {
         {
             return Err(profile_err(ProfileError::RevisionConflict));
         }
-        let upserted: HashSet<String> = p
-            .profiles
-            .iter()
-            .flatten()
-            .map(|x| base_name(&x.process).to_ascii_lowercase())
-            .collect();
+        let upserted: HashSet<ProfileKey> =
+            p.profiles.iter().flatten().map(ProfileKey::of).collect();
         let upserted_layouts: HashSet<String> =
             p.layouts.iter().flatten().map(|l| l.id.clone()).collect();
         profiles::upsert(
@@ -1952,7 +2022,14 @@ impl Engine {
             .filter(|w| {
                 profiles::is_blocking(&w.code)
                     && match w.data.get("process").and_then(Value::as_str) {
-                        Some(n) => upserted.contains(&base_name(n).to_ascii_lowercase()),
+                        Some(n) => {
+                            let rule = |k: &str| w.data.get(k).and_then(Value::as_str);
+                            upserted.contains(&ProfileKey::new(
+                                n,
+                                rule("title"),
+                                rule("title_regex"),
+                            ))
+                        }
                         None => w
                             .data
                             .get("layout")
@@ -1977,7 +2054,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::{MonitorChoice, Profile};
+    use crate::profiles::MonitorChoice;
 
     const fn r(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
         Rect {
@@ -2040,6 +2117,8 @@ mod tests {
     fn profile(process: &str) -> Profile {
         Profile {
             process: process.into(),
+            title: None,
+            title_regex: None,
             enabled: true,
             monitor: MonitorChoice::Current,
             offsets: Offsets::default(),
@@ -2071,9 +2150,14 @@ mod tests {
         }
     }
 
+    /// What `plan_for` builds for a window of `name` titled `title`.
+    fn plan_of(f: &ProfileFile, name: &str, title: &str, rq: PlanReq) -> Result<Plan, ErrorBody> {
+        build_plan(profiles::find(&f.profiles, name, title), rq)
+    }
+
     #[test]
     fn plan_without_profile_or_params_uses_current_monitor() {
-        let plan = build_plan(&file(vec![]), "PWAAT.exe", req()).unwrap();
+        let plan = plan_of(&file(vec![]), "PWAAT.exe", "", req()).unwrap();
         assert_eq!(plan.island, None);
         assert_eq!(plan.monitor, None);
         assert_eq!(plan.offsets, Offsets::default());
@@ -2087,7 +2171,7 @@ mod tests {
         p.island = Some("l/i".into());
         p.monitor = MonitorChoice::Index(2);
         p.offsets.left = 10;
-        let plan = build_plan(&file(vec![p]), "C:\\Games\\PWAAT.exe", req()).unwrap();
+        let plan = plan_of(&file(vec![p]), "C:\\Games\\PWAAT.exe", "", req()).unwrap();
         assert_eq!(plan.island.as_deref(), Some("l/i"));
         assert_eq!(plan.monitor, None);
         assert_eq!(plan.offsets, Offsets::default());
@@ -2099,7 +2183,7 @@ mod tests {
         p.monitor = MonitorChoice::Index(1);
         p.offsets.top = 5;
         p.delay_ms = 250;
-        let plan = build_plan(&file(vec![p]), "PWAAT.exe", req()).unwrap();
+        let plan = plan_of(&file(vec![p]), "PWAAT.exe", "", req()).unwrap();
         assert_eq!(plan.monitor, Some(MonitorSel::Index(1)));
         assert_eq!(plan.offsets.top, 5);
         assert_eq!(plan.delay_ms, 250);
@@ -2111,7 +2195,7 @@ mod tests {
         p.monitor = MonitorChoice::Index(1);
         let mut rq = req();
         rq.island = Some("a/b".into());
-        let plan = build_plan(&file(vec![p]), "PWAAT.exe", rq).unwrap();
+        let plan = plan_of(&file(vec![p]), "PWAAT.exe", "", rq).unwrap();
         assert_eq!(plan.island.as_deref(), Some("a/b"));
         assert_eq!(plan.monitor, None);
     }
@@ -2122,7 +2206,7 @@ mod tests {
         p.island = Some("l/i".into());
         let mut rq = req();
         rq.monitor = Some(MonitorSel::Primary);
-        let plan = build_plan(&file(vec![p]), "PWAAT.exe", rq).unwrap();
+        let plan = plan_of(&file(vec![p]), "PWAAT.exe", "", rq).unwrap();
         assert_eq!(plan.island, None);
         assert_eq!(plan.monitor, Some(MonitorSel::Primary));
         assert!(!plan.lenient);
@@ -2135,7 +2219,7 @@ mod tests {
         p.delay_ms = 99;
         let mut rq = req();
         rq.use_profile = false;
-        let plan = build_plan(&file(vec![p]), "PWAAT.exe", rq).unwrap();
+        let plan = plan_of(&file(vec![p]), "PWAAT.exe", "", rq).unwrap();
         assert_eq!(plan.island, None);
         assert_eq!(plan.delay_ms, 0);
     }
@@ -2145,7 +2229,7 @@ mod tests {
         let mut rq = req();
         rq.delay_ms = Some(u64::MAX);
         assert_eq!(
-            build_plan(&file(vec![]), "a.exe", rq).unwrap_err().code,
+            build_plan(None, rq).unwrap_err().code,
             ErrorCode::InvalidParams
         );
         let mut rq = req();
@@ -2154,20 +2238,32 @@ mod tests {
             ..Offsets::default()
         });
         assert_eq!(
-            build_plan(&file(vec![]), "a.exe", rq).unwrap_err().code,
+            build_plan(None, rq).unwrap_err().code,
             ErrorCode::InvalidParams
         );
         let mut rq = req();
         rq.delay_ms = Some(MAX_DELAY_MS);
-        assert!(build_plan(&file(vec![]), "a.exe", rq).is_ok());
+        assert!(build_plan(None, rq).is_ok());
     }
 
     #[test]
     fn plan_clamps_profile_delay() {
         let mut p = profile("a.exe");
         p.delay_ms = u64::MAX;
-        let plan = build_plan(&file(vec![p]), "a.exe", req()).unwrap();
+        let plan = plan_of(&file(vec![p]), "a.exe", "", req()).unwrap();
         assert_eq!(plan.delay_ms, MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn plan_uses_the_best_match_for_the_window_title() {
+        let mut any = profile("a.exe");
+        any.delay_ms = 1;
+        let mut main = profile("a.exe");
+        main.title = Some("Main".into());
+        main.delay_ms = 2;
+        let f = file(vec![any, main]);
+        assert_eq!(plan_of(&f, "a.exe", " MAIN ", req()).unwrap().delay_ms, 2);
+        assert_eq!(plan_of(&f, "a.exe", "Other", req()).unwrap().delay_ms, 1);
     }
 
     #[test]
@@ -2378,6 +2474,7 @@ mod tests {
             managed: HashMap::new(),
             diags: Vec::new(),
             user_restored: HashSet::new(),
+            auto_failed: HashSet::new(),
             last_foreground: 0,
             tick_armed: false,
             status: None,
@@ -2449,16 +2546,137 @@ mod tests {
         tag: &str,
         params: &str,
     ) -> (Result<SetProfilesResult, ErrorBody>, Vec<u8>) {
+        set_profiles_call_on(tag, SET_PROFILES_FILE, params)
+    }
+
+    /// [`set_profiles_call`] on a `file` copy.
+    fn set_profiles_call_on(
+        tag: &str,
+        file: &str,
+        params: &str,
+    ) -> (Result<SetProfilesResult, ErrorBody>, Vec<u8>) {
         let dir = std::env::temp_dir().join(format!("bs-engine-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("profiles.json");
-        std::fs::write(&path, SET_PROFILES_FILE).unwrap();
+        std::fs::write(&path, file).unwrap();
         let p: SetProfilesParams =
             crate::ipc::parse_params(serde_json::from_str(params).unwrap()).unwrap();
         let res = Engine::apply_set_profiles(&path, p).map(|(_, r)| r);
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         (res, bytes)
+    }
+
+    fn codes(warnings: &Value) -> Vec<&str> {
+        warnings
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["code"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn set_profiles_blocks_only_the_keys_it_wrote() {
+        const OLD: &str =
+            r#"{"version":2,"profiles":[{"process":"a.exe","title":"x","title_regex":"y"}]}"#;
+        let (res, _) = set_profiles_call_on(
+            "key-other",
+            OLD,
+            r#"{"profiles":[{"process":"A.exe","title":"Other"}]}"#,
+        );
+        let r = res.unwrap();
+        assert_eq!(codes(&json!(r.warnings)), ["title_rule_conflict"]);
+        let (res, bytes) = set_profiles_call_on(
+            "key-same",
+            OLD,
+            r#"{"profiles":[{"process":"a.exe","title":" X ","title_regex":"y","delay_ms":1}]}"#,
+        );
+        let e = res.unwrap_err();
+        assert_eq!(e.code, ErrorCode::ProfileError);
+        assert_eq!(codes(&e.data.unwrap()["warnings"]), ["title_rule_conflict"]);
+        assert_eq!(bytes, OLD.as_bytes());
+    }
+
+    #[test]
+    fn set_profiles_remove_by_string_or_object() {
+        const TWO: &str = r#"{"version":2,"profiles":[{"process":"a.exe"},{"process":"a.exe","title":"T"},{"process":"a.exe","title_regex":"R"}]}"#;
+        // (title, title_regex) of each profile left on disk.
+        let left = |tag: &str, params: &str| {
+            let (res, bytes) = set_profiles_call_on(tag, TWO, params);
+            res.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            v["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (p["title"].clone(), p["title_regex"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            left("rm-str", r#"{"remove":["a.exe"]}"#),
+            [(json!("T"), Value::Null), (Value::Null, json!("R"))]
+        );
+        assert_eq!(
+            left(
+                "rm-obj",
+                r#"{"remove":[{"process":"a.exe","title":"t"},{"process":"a.exe","title_regex":"R"}]}"#,
+            ),
+            [(Value::Null, Value::Null)]
+        );
+    }
+
+    #[test]
+    fn auto_profile_on_rename_needs_a_title_rule() {
+        let mut titled = profile("g.exe");
+        titled.title = Some("Main".into());
+        let mut off = profile("g.exe");
+        off.title = Some("Launcher".into());
+        off.enabled = false;
+        let ps = [profile("g.exe"), titled, off];
+        let auto = |title: &str, renamed: bool| {
+            auto_profile(&ps, "g.exe", title, renamed).map(|p| p.title.as_deref())
+        };
+        assert_eq!(auto("Loading", false), Some(None));
+        assert_eq!(auto("Loading", true), None);
+        assert_eq!(auto("main", true), Some(Some("Main")));
+        assert_eq!(auto("main", false), Some(Some("Main")));
+        assert_eq!(auto("launcher", false), None);
+        assert_eq!(auto("launcher", true), None);
+    }
+
+    #[test]
+    fn a_rename_is_matched_only_with_title_rules_and_no_earlier_auto_failure() {
+        let mut titled = profile("g.exe");
+        titled.title_regex = Some("^Main".into());
+        // No profile has a title rule: a rename can never change the outcome.
+        assert!(!rename_worth_matching(&[profile("g.exe")], false));
+        assert!(rename_worth_matching(
+            &[profile("g.exe"), titled.clone()],
+            false
+        ));
+        // Its automatic apply failed already: a title change does not retry it.
+        assert!(!rename_worth_matching(&[titled], true));
+    }
+
+    #[test]
+    fn a_failed_auto_apply_is_remembered() {
+        let mut e = bare_engine();
+        // HWND_NOTOPMOST: never a window, so nothing on the desktop is touched.
+        let raw = -2;
+        e.apply_auto(win32::hwnd_from_isize(raw), Ok(Plan::default()));
+        assert!(e.auto_failed.contains(&raw));
+    }
+
+    #[test]
+    fn tray_apply_skips_windows_whose_best_match_is_disabled() {
+        let mut launcher = profile("g.exe");
+        launcher.title = Some("Launcher".into());
+        launcher.enabled = false;
+        let ps = [profile("g.exe"), launcher];
+        assert!(tray_profile(&ps, "C:\\G\\g.exe", "Game", "G.EXE").is_some());
+        assert!(tray_profile(&ps, "g.exe", "launcher", "g.exe").is_none());
+        assert!(tray_profile(&ps, "g.exe", "Game", "other.exe").is_none());
     }
 
     /// IPC params text → `parse_params` → `apply_set_profiles` → the saved file as JSON.

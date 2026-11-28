@@ -5,13 +5,14 @@
 use std::time::{Duration, Instant};
 
 use gpui_kit::AppContext as _;
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     ClickEvent, Context, Div, ElementId, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, px,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, px,
 };
 use serde_json::{Value, json};
 
@@ -27,7 +28,9 @@ use crate::ipc::{
     SetProfilesParams, SetProfilesResult,
 };
 use crate::islands::{Layout, Size, canonical_ref, merged_layouts};
-use crate::profiles::{MonitorChoice, Profile, Warning, is_excluded};
+use crate::profiles::{
+    MonitorChoice, Profile, ProfileKey, Warning, find, is_excluded, title_regex_ok,
+};
 use crate::window_state::Offsets;
 
 // =================================================================== pure logic
@@ -39,6 +42,8 @@ pub const MAX_RESOLUTION: i64 = 1_000_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Process,
+    /// The window rule (any window / exact title / regex): the kind chips and their text.
+    Rule,
     Left,
     Top,
     Right,
@@ -51,6 +56,14 @@ pub enum Field {
     Monitor,
 }
 
+/// Which windows of the process a profile applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleKind {
+    Any,
+    Exact,
+    Regex,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldError {
     pub field: Field,
@@ -61,6 +74,9 @@ pub struct FieldError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormInput {
     pub process: String,
+    pub rule: RuleKind,
+    /// Title or regex, as typed; ignored for `RuleKind::Any`.
+    pub rule_text: String,
     pub enabled: bool,
     pub island: Option<String>,
     pub monitor: MonitorChoice,
@@ -75,6 +91,8 @@ impl FormInput {
     pub fn blank() -> Self {
         Self {
             process: String::new(),
+            rule: RuleKind::Any,
+            rule_text: String::new(),
             enabled: true,
             island: None,
             monitor: MonitorChoice::Current,
@@ -87,7 +105,14 @@ impl FormInput {
 
     pub fn from_profile(p: &Profile) -> Self {
         let o = p.offsets;
+        let (rule, rule_text) = match (&p.title, &p.title_regex) {
+            (Some(t), _) => (RuleKind::Exact, t.clone()),
+            (None, Some(r)) => (RuleKind::Regex, r.clone()),
+            (None, None) => (RuleKind::Any, String::new()),
+        };
         Self {
+            rule,
+            rule_text,
             process: p.process.clone(),
             enabled: p.enabled,
             island: p.island.clone(),
@@ -133,18 +158,49 @@ fn parse_in(text: &str, lo: i64, hi: i64, empty: Option<i64>) -> Result<i64, Str
     }
 }
 
-/// Form -> profile. `existing` are the saved profiles (for duplicates); `original` is the process
-/// being edited (its own entry is not a duplicate). With an island chosen, monitor and offsets
-/// are not validated and are stored as default (the island overrides them).
+/// Form -> profile. `existing` are the saved profiles (for duplicates); `original` is the key of
+/// the profile being edited (its own entry is not a duplicate). With an island chosen, monitor
+/// and offsets are not validated and are stored as default (the island overrides them).
 pub fn build_profile(
     f: &FormInput,
     existing: &[Profile],
-    original: Option<&str>,
+    original: Option<&ProfileKey>,
 ) -> Result<Profile, Vec<FieldError>> {
     let mut errs = Vec::new();
     let mut err = |field, message: String| errs.push(FieldError { field, message });
 
     let process = f.process.trim();
+    let (title, title_regex) = match f.rule {
+        RuleKind::Any => (None, None),
+        RuleKind::Exact => (Some(f.rule_text.trim().to_owned()), None),
+        RuleKind::Regex => (None, Some(f.rule_text.clone())),
+    };
+    let rule_ok = match f.rule {
+        RuleKind::Any => true,
+        _ if f.rule_text.trim().is_empty() => {
+            err(
+                Field::Rule,
+                i18n::t("profiles.error.rule_required").into_owned(),
+            );
+            false
+        }
+        RuleKind::Regex if !title_regex_ok(&f.rule_text) => {
+            err(
+                Field::Rule,
+                i18n::t("profiles.error.rule_regex_invalid").into_owned(),
+            );
+            false
+        }
+        _ => true,
+    };
+    // A hand-edited file can give a profile both rules. The form shows one of them, so saving
+    // would create another profile and leave this one behind: only Delete is offered.
+    if original.is_some_and(|k| k.title.is_some() && k.title_regex.is_some()) {
+        err(
+            Field::Rule,
+            i18n::t("profiles.error.rule_conflict").into_owned(),
+        );
+    }
     if process.is_empty() {
         err(
             Field::Process,
@@ -155,13 +211,17 @@ pub fn build_profile(
             Field::Process,
             i18n::t("profiles.error.process_excluded").into_owned(),
         );
-    } else if existing.iter().any(|p| {
-        same_process(&p.process, process) && original.is_none_or(|o| !same_process(o, process))
-    }) {
-        err(
-            Field::Process,
-            i18n::t("profiles.error.process_duplicate").into_owned(),
-        );
+    } else if rule_ok {
+        let key = ProfileKey::new(process, title.as_deref(), title_regex.as_deref());
+        if original != Some(&key) && existing.iter().any(|p| ProfileKey::of(p) == key) {
+            // Without a rule the clash is the process; with one, the rule.
+            let (field, msg) = if f.rule == RuleKind::Any {
+                (Field::Process, "profiles.error.process_duplicate")
+            } else {
+                (Field::Rule, "profiles.error.rule_duplicate")
+            };
+            err(field, i18n::t(msg).into_owned());
+        }
     }
 
     let mut offsets = Offsets::default();
@@ -226,6 +286,8 @@ pub fn build_profile(
     let island = f.island.clone();
     Ok(Profile {
         process: process.to_owned(),
+        title,
+        title_regex,
         enabled: f.enabled,
         monitor: if island.is_some() {
             MonitorChoice::Current
@@ -241,22 +303,62 @@ pub fn build_profile(
     })
 }
 
-/// Indices into `profiles` that match `query` (process or island, case-insensitive), sorted by
-/// process name (case-insensitive, stable).
+/// Precedence of a profile's rule inside its process: exact title, regex, any window.
+fn rule_rank(p: &Profile) -> u8 {
+    match (&p.title, &p.title_regex) {
+        (Some(_), _) => 0,
+        (None, Some(_)) => 1,
+        (None, None) => 2,
+    }
+}
+
+/// Indices into `profiles` that match `query` (process, rule text or island, case-insensitive),
+/// sorted by process name (case-insensitive), then by precedence (exact title, regex, any
+/// window), then by file order (the sort is stable).
 pub fn sorted_filtered(profiles: &[Profile], query: &str) -> Vec<usize> {
     let q = query.trim().to_lowercase();
+    let has = |s: Option<&str>| s.is_some_and(|s| s.to_lowercase().contains(&q));
     let mut idx: Vec<usize> = (0..profiles.len())
         .filter(|&i| {
             let p = &profiles[i];
             q.is_empty()
                 || p.process.to_lowercase().contains(&q)
-                || p.island
-                    .as_deref()
-                    .is_some_and(|s| s.to_lowercase().contains(&q))
+                || has(p.title.as_deref())
+                || has(p.title_regex.as_deref())
+                || has(p.island.as_deref())
         })
         .collect();
-    idx.sort_by_cached_key(|&i| profiles[i].process.to_lowercase());
+    idx.sort_by_cached_key(|&i| (profiles[i].process.to_lowercase(), rule_rank(&profiles[i])));
     idx
+}
+
+/// `process`, or `process — title "X"` / `process — regex X` for a profile with a rule: what
+/// names a profile in notices, warnings and the delete confirmation.
+pub fn rule_label(process: &str, title: Option<&str>, title_regex: Option<&str>) -> String {
+    match (title, title_regex) {
+        (Some(t), _) => i18n::tf(
+            "profiles.rule.label_title",
+            &[("process", &process), ("title", &t)],
+        ),
+        (None, Some(r)) => i18n::tf(
+            "profiles.rule.label_regex",
+            &[("process", &process), ("regex", &r)],
+        ),
+        (None, None) => process.to_owned(),
+    }
+}
+
+fn profile_label(p: &Profile) -> String {
+    rule_label(&p.process, p.title.as_deref(), p.title_regex.as_deref())
+}
+
+/// The list's secondary line for a profile with a rule (`None` for any window).
+pub fn rule_line(p: &Profile) -> Option<String> {
+    match (&p.title, &p.title_regex) {
+        (Some(t), _) => Some(i18n::tf("profiles.rule.line_title", &[("title", t)])),
+        (None, Some(r)) => Some(i18n::tf("profiles.rule.line_regex", &[("regex", r)])),
+        (None, None) => None,
+    }
 }
 
 /// Canonical form of a legacy island ref that still resolves; `None` when the ref is already
@@ -335,7 +437,9 @@ pub fn suggestions(
         let p = base_name(p);
         if p.is_empty()
             || is_excluded(p)
-            || profiles.iter().any(|x| same_process(&x.process, p))
+            || profiles.iter().any(|x| {
+                same_process(&x.process, p) && x.title.is_none() && x.title_regex.is_none()
+            })
             || !p.to_lowercase().contains(&q)
             || out.iter().any(|o| o.eq_ignore_ascii_case(p))
         {
@@ -354,7 +458,9 @@ fn wstr<'a>(w: &'a Warning, key: &str) -> &'a str {
 
 /// Text for a profile-file warning (`code` is stable, `data` has the context).
 pub fn warning_text(w: &Warning) -> String {
-    let (process, island, layout) = (wstr(w, "process"), wstr(w, "island"), wstr(w, "layout"));
+    let opt = |k: &str| w.data.get(k).and_then(Value::as_str);
+    let process = rule_label(wstr(w, "process"), opt("title"), opt("title_regex"));
+    let (island, layout) = (wstr(w, "island"), wstr(w, "layout"));
     match w.code.as_str() {
         "island_overrides_monitor" => i18n::tf(
             "profiles.warning.island_overrides_monitor",
@@ -390,6 +496,16 @@ pub fn warning_text(w: &Warning) -> String {
             "profiles.warning.bad_island_rect",
             &[("island", &island), ("layout", &layout)],
         ),
+        "bad_title" => i18n::tf("profiles.warning.bad_title", &[("process", &process)]),
+        "bad_title_regex" => i18n::tf("profiles.warning.bad_title_regex", &[("process", &process)]),
+        "title_rule_conflict" => i18n::tf(
+            "profiles.warning.title_rule_conflict",
+            &[("process", &process)],
+        ),
+        "duplicate_profile" => i18n::tf(
+            "profiles.warning.duplicate_profile",
+            &[("process", &process)],
+        ),
         other => i18n::tf("profiles.warning.unknown", &[("code", &other)]),
     }
 }
@@ -400,20 +516,27 @@ pub enum OutsideChange {
     /// The edited profile is the same in the new data: the form stays as typed.
     None,
     /// It changed outside: merge it into the form (see [`after_reload`]).
-    Changed(Profile),
+    Changed(Box<Profile>),
     /// It was removed outside: saving the form creates it again.
     Removed,
 }
 
-/// Compares the edited profile in the data the form came from (`old`) with the reloaded `new`.
-pub fn outside_change(original: Option<&str>, old: &[Profile], new: &[Profile]) -> OutsideChange {
+/// Compares the edited profile in the data the form came from (`old`) with the reloaded `new`;
+/// the profile is found by key, so another profile of the same process is never mistaken for it.
+pub fn outside_change(
+    original: Option<&ProfileKey>,
+    old: &[Profile],
+    new: &[Profile],
+) -> OutsideChange {
     let Some(o) = original else {
         return OutsideChange::None;
     };
-    let find = |ps: &[Profile]| ps.iter().find(|p| same_process(&p.process, o)).cloned();
+    let find = |ps: &[Profile]| ps.iter().find(|p| ProfileKey::of(p) == *o).cloned();
     match (find(old), find(new)) {
         (Some(_), None) => OutsideChange::Removed,
-        (before, Some(now)) if before.as_ref() != Some(&now) => OutsideChange::Changed(now),
+        (before, Some(now)) if before.as_ref() != Some(&now) => {
+            OutsideChange::Changed(Box::new(now))
+        }
         _ => OutsideChange::None,
     }
 }
@@ -444,6 +567,7 @@ const MERGE_FIELDS: [Field; 11] = [
 fn text_of(f: &FormInput, field: Field) -> Option<&str> {
     Some(match field {
         Field::Process => &f.process,
+        Field::Rule => &f.rule_text,
         Field::Left => &f.offsets[0],
         Field::Top => &f.offsets[1],
         Field::Right => &f.offsets[2],
@@ -461,6 +585,7 @@ fn same_field(a: &FormInput, b: &FormInput, field: Field) -> bool {
         Field::Enabled => a.enabled == b.enabled,
         Field::Island => a.island.as_deref().map(str::trim) == b.island.as_deref().map(str::trim),
         Field::Monitor => a.monitor == b.monitor,
+        Field::Rule => a.rule == b.rule && a.rule_text.trim() == b.rule_text.trim(),
         _ => text_of(a, field).map(str::trim) == text_of(b, field).map(str::trim),
     }
 }
@@ -472,6 +597,10 @@ fn copy_field(dst: &mut FormInput, src: &FormInput, field: Field) {
         Field::Island => dst.island.clone_from(&src.island),
         Field::Monitor => dst.monitor = src.monitor,
         Field::Process => dst.process.clone_from(&src.process),
+        Field::Rule => {
+            dst.rule = src.rule;
+            dst.rule_text.clone_from(&src.rule_text);
+        }
         Field::Left => dst.offsets[0].clone_from(&src.offsets[0]),
         Field::Top => dst.offsets[1].clone_from(&src.offsets[1]),
         Field::Right => dst.offsets[2].clone_from(&src.offsets[2]),
@@ -671,33 +800,76 @@ fn load(c: &mut crate::ipc::pipe::Client) -> Result<Reply<Data>, CallError> {
 #[derive(Clone)]
 enum Op {
     Upsert(Profile),
-    Remove(String),
+    Remove(Profile),
 }
 
-/// A notice kept as its i18n key and process name, so it is translated when shown.
+/// The `set_profiles` call that carries `op`: an upsert by key, or a remove by the full key.
+fn set_params(op: Op, revision: String) -> SetProfilesParams {
+    let mut p = SetProfilesParams {
+        expected_revision: Some(revision),
+        ..Default::default()
+    };
+    match op {
+        Op::Upsert(x) => p.profiles = Some(vec![x]),
+        Op::Remove(x) => p.remove = Some(vec![ProfileKey::of(&x)]),
+    }
+    p
+}
+
+fn rule_placeholder(kind: RuleKind) -> String {
+    match kind {
+        RuleKind::Regex => i18n::t("profiles.editor.rule_regex_placeholder"),
+        _ => i18n::t("profiles.editor.rule_exact_placeholder"),
+    }
+    .into_owned()
+}
+
+/// A notice kept as its i18n key and the profile it names (process and rule), so both are
+/// translated when shown.
 struct Notice {
     key: &'static str,
     process: String,
+    title: Option<String>,
+    title_regex: Option<String>,
 }
 
 impl Notice {
-    fn new(key: &'static str, process: &str) -> Self {
+    fn new(key: &'static str, p: &Profile) -> Self {
         Self {
             key,
-            process: process.to_owned(),
+            process: p.process.clone(),
+            title: p.title.clone(),
+            title_regex: p.title_regex.clone(),
+        }
+    }
+
+    fn of_key(key: &'static str, k: &ProfileKey) -> Self {
+        Self {
+            key,
+            process: k.process.clone(),
+            title: k.title.clone(),
+            title_regex: k.title_regex.clone(),
         }
     }
 
     fn text(&self) -> String {
-        i18n::tf(self.key, &[("process", &self.process)])
+        let name = rule_label(
+            &self.process,
+            self.title.as_deref(),
+            self.title_regex.as_deref(),
+        );
+        i18n::tf(self.key, &[("process", &name)])
     }
 }
 
 // ===================================================================== the view
 
 struct Editor {
-    /// Process being edited (None = new profile).
-    original: Option<String>,
+    /// Key of the profile being edited (None = new profile).
+    original: Option<ProfileKey>,
+    rule_kind: RuleKind,
+    /// Exact title or regex text, depending on `rule_kind`.
+    rule: Entity<InputState>,
     process: Entity<InputState>,
     offsets: [Entity<InputState>; 4],
     delay: Entity<InputState>,
@@ -719,6 +891,7 @@ impl Editor {
         Some(
             match field {
                 Field::Process => &self.process,
+                Field::Rule => &self.rule,
                 Field::Left => &self.offsets[0],
                 Field::Top => &self.offsets[1],
                 Field::Right => &self.offsets[2],
@@ -752,7 +925,7 @@ pub struct ProfilesView {
     refill: Option<Merged>,
     /// Why the open form no longer matches what it was opened with (shown while editing).
     outside: Option<Notice>,
-    confirm_delete: Option<String>,
+    confirm_delete: Option<Profile>,
     last_render: Instant,
     /// Language the editor placeholders were last set for.
     locale: Locale,
@@ -836,6 +1009,7 @@ impl ProfilesView {
             i18n::t("profiles.editor.process_placeholder").into_owned(),
             cx,
         );
+        set(&e.rule, rule_placeholder(e.rule_kind), cx);
         set(
             &e.width,
             i18n::t("profiles.editor.width_placeholder").into_owned(),
@@ -848,21 +1022,28 @@ impl ProfilesView {
         );
     }
 
-    /// Hook for Diagnostics: open the editor for `process` (existing profile or a new one) with
-    /// `game_resolution` preloaded, without saving.
+    /// Hook for Diagnostics: open the editor for the profile that applies to the window `title`
+    /// of `process` (or a new rule-less one) with `game_resolution` preloaded, without saving.
+    /// Without the title (the window is gone) only the process-only profile is opened: a title
+    /// rule is never guessed.
     pub fn prefill_resolution(
         &mut self,
         process: &str,
+        title: Option<&str>,
         width: i32,
         height: i32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let existing = self.data.as_ref().and_then(|d| {
-            d.profiles
-                .iter()
-                .find(|p| same_process(&p.process, process))
-                .cloned()
+            match title {
+                Some(t) => find(&d.profiles, process, t),
+                None => {
+                    let key = ProfileKey::from(process);
+                    d.profiles.iter().find(|p| ProfileKey::of(p) == key)
+                }
+            }
+            .cloned()
         });
         let mut form = existing
             .as_ref()
@@ -872,7 +1053,7 @@ impl ProfilesView {
         }
         form.width = width.to_string();
         form.height = height.to_string();
-        self.open_editor(&form, existing.map(|p| p.process), window, cx);
+        self.open_editor(&form, existing.as_ref().map(ProfileKey::of), window, cx);
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -896,7 +1077,7 @@ impl ProfilesView {
                 let outcome = match (&self.editor, &self.data, self.form(cx)) {
                     (Some(e), Some(old), Some(mine)) => {
                         let change =
-                            outside_change(e.original.as_deref(), &old.profiles, &d.profiles);
+                            outside_change(e.original.as_ref(), &old.profiles, &d.profiles);
                         after_reload(e.base.as_ref(), &mine, &e.conflicts, &change)
                     }
                     _ => ReloadOutcome::Keep,
@@ -911,7 +1092,7 @@ impl ProfilesView {
                             self.outside = e
                                 .original
                                 .take()
-                                .map(|o| Notice::new("profiles.outside.removed", &o));
+                                .map(|o| Notice::of_key("profiles.outside.removed", &o));
                         }
                     }
                 }
@@ -929,27 +1110,36 @@ impl ProfilesView {
     fn open_editor(
         &mut self,
         f: &FormInput,
-        original: Option<String>,
+        original: Option<ProfileKey>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut subs = Vec::new();
         let process_ph = i18n::t("profiles.editor.process_placeholder");
         let process = new_input(window, cx, &process_ph, &f.process, &mut subs);
+        let rule = new_input(
+            window,
+            cx,
+            &rule_placeholder(f.rule),
+            &f.rule_text,
+            &mut subs,
+        );
         let offsets = [0, 1, 2, 3].map(|i| new_input(window, cx, "0", &f.offsets[i], &mut subs));
         let delay = new_input(window, cx, "0", &f.delay, &mut subs);
         let width_ph = i18n::t("profiles.editor.width_placeholder");
         let width = new_input(window, cx, &width_ph, &f.width, &mut subs);
         let height_ph = i18n::t("profiles.editor.height_placeholder");
         let height = new_input(window, cx, &height_ph, &f.height, &mut subs);
-        let base = original.as_deref().and_then(|o| {
+        let base = original.as_ref().and_then(|o| {
             let d = self.data.as_ref()?;
-            let p = d.profiles.iter().find(|p| same_process(&p.process, o))?;
+            let p = d.profiles.iter().find(|p| ProfileKey::of(p) == *o)?;
             Some(FormInput::from_profile(p))
         });
         self.editor = Some(Editor {
             original,
             process,
+            rule_kind: f.rule,
+            rule,
             offsets,
             delay,
             width,
@@ -972,6 +1162,8 @@ impl ProfilesView {
         let v = |s: &Entity<InputState>| s.read(cx).value().to_string();
         Some(FormInput {
             process: v(&e.process),
+            rule: e.rule_kind,
+            rule_text: v(&e.rule),
             enabled: e.enabled,
             island: e.island.clone(),
             monitor: e.monitor,
@@ -991,19 +1183,12 @@ impl ProfilesView {
         self.notice = None;
         cx.notify();
         let done = match &op {
-            Op::Upsert(p) => Notice::new("profiles.saved", &p.process),
-            Op::Remove(n) => Notice::new("profiles.removed", n),
+            Op::Upsert(p) => Notice::new("profiles.saved", p),
+            Op::Remove(p) => Notice::new("profiles.removed", p),
         };
         cx.spawn(async move |this, cx| {
             let r = ipc_call(cx, move |c| {
-                let mut p = SetProfilesParams {
-                    expected_revision: Some(revision),
-                    ..Default::default()
-                };
-                match op {
-                    Op::Upsert(x) => p.profiles = Some(vec![x]),
-                    Op::Remove(n) => p.remove = Some(vec![n]),
-                }
+                let p = set_params(op, revision);
                 let params = serde_json::to_value(p).map_err(json_err)?;
                 match split(c.call("set_profiles", params))? {
                     Reply::Ok(v) => Ok(Reply::Ok(
@@ -1051,7 +1236,7 @@ impl ProfilesView {
         if !e.conflicts.is_empty() {
             return;
         }
-        if let Ok(p) = build_profile(&form, &d.profiles, e.original.as_deref()) {
+        if let Ok(p) = build_profile(&form, &d.profiles, e.original.as_ref()) {
             self.submit(Op::Upsert(p), cx);
         }
     }
@@ -1092,7 +1277,7 @@ fn chip(
     selected: bool,
     disabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
-) -> Stateful<Div> {
+) -> impl IntoElement {
     let d = div()
         .id(id)
         .min_h(HIT)
@@ -1113,7 +1298,7 @@ fn chip(
             FontWeight::NORMAL
         })
         .child(label.into());
-    if disabled {
+    let d = if disabled {
         d.opacity(0.4).cursor_default()
     } else {
         d.focusable()
@@ -1121,7 +1306,9 @@ fn chip(
             .cursor_pointer()
             .hover(|s| s.bg(text().opacity(0.08)))
             .on_click(on_click)
-    }
+    };
+    // Lets headless UI tests find and click it by id; a no-op in normal builds.
+    d.test_support()
 }
 
 fn labeled(label: &str, child: impl IntoElement, error: Option<&str>) -> Div {
@@ -1177,12 +1364,12 @@ impl Render for ProfilesView {
         self.sync_locale(window, cx);
         if let Some(m) = self.refill.take() {
             let original = self.editor.as_ref().and_then(|e| e.original.clone());
-            if let Some(process) = original.clone() {
+            if let Some(key) = original.clone() {
                 self.open_editor(&m.form, original, window, cx);
                 if let Some(e) = &mut self.editor {
                     e.conflicts = m.conflicts;
                 }
-                self.outside = Some(Notice::new("profiles.outside.merged", &process));
+                self.outside = Some(Notice::of_key("profiles.outside.merged", &key));
             }
         }
         self.last_render = Instant::now();
@@ -1374,7 +1561,7 @@ impl ProfilesView {
     fn merge_card(&self, cx: &mut Context<Self>) -> Div {
         let valid = match (&self.editor, &self.data, self.form(cx)) {
             (Some(e), Some(d), Some(f)) => {
-                build_profile(&f, &d.profiles, e.original.as_deref()).is_ok()
+                build_profile(&f, &d.profiles, e.original.as_ref()).is_ok()
             }
             _ => false,
         };
@@ -1421,8 +1608,9 @@ impl ProfilesView {
         let locked = self.read_only || self.saving || self.editor.is_some();
         let order = sorted_filtered(&d.profiles, "");
         let mut list = card();
-        if let Some(name) = &self.confirm_delete {
-            let n = name.clone();
+        if let Some(victim) = &self.confirm_delete {
+            let name = profile_label(victim);
+            let victim = victim.clone();
             list = list.child(
                 div()
                     .flex()
@@ -1434,7 +1622,7 @@ impl ProfilesView {
                     .child(
                         div()
                             .flex_1()
-                            .child(i18n::tf("profiles.list.confirm_delete", &[("name", name)])),
+                            .child(i18n::tf("profiles.list.confirm_delete", &[("name", &name)])),
                     )
                     .child(secondary_button(
                         "delete-cancel",
@@ -1448,7 +1636,9 @@ impl ProfilesView {
                         primary_button(
                             "delete-confirm",
                             i18n::t("profiles.list.delete").into_owned(),
-                            cx.listener(move |t, _, _, cx| t.submit(Op::Remove(n.clone()), cx)),
+                            cx.listener(move |t, _, _, cx| {
+                                t.submit(Op::Remove(victim.clone()), cx)
+                            }),
                         )
                         .icon(IconName::Delete)
                         .disabled(self.saving),
@@ -1458,7 +1648,7 @@ impl ProfilesView {
         for i in order {
             let p = &d.profiles[i];
             let name = p.process.clone();
-            let name_for_delete = name.clone();
+            let victim = p.clone();
             list = list.child(
                 div()
                     .min_h(HIT)
@@ -1477,6 +1667,17 @@ impl ProfilesView {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(name.clone()),
                             )
+                            .when_some(rule_line(p), |c, line| {
+                                c.child(
+                                    div()
+                                        .id(SharedString::from(format!("rule-{i}")))
+                                        .truncate()
+                                        .text_size(TEXT_SM)
+                                        .text_color(text_muted())
+                                        .child(line)
+                                        .test_support(),
+                                )
+                            })
                             .child(
                                 div()
                                     .truncate()
@@ -1516,7 +1717,8 @@ impl ProfilesView {
                                 else {
                                     return;
                                 };
-                                t.open_editor(&FormInput::from_profile(&p), Some(p.process), w, cx);
+                                let key = ProfileKey::of(&p);
+                                t.open_editor(&FormInput::from_profile(&p), Some(key), w, cx);
                             }),
                         )
                         .icon(IconName::Settings)
@@ -1527,7 +1729,7 @@ impl ProfilesView {
                             SharedString::from(format!("delete-{i}")),
                             i18n::t("profiles.list.delete").into_owned(),
                             cx.listener(move |t, _, _, cx| {
-                                t.confirm_delete = Some(name_for_delete.clone());
+                                t.confirm_delete = Some(victim.clone());
                                 cx.notify();
                             }),
                         )
@@ -1543,7 +1745,7 @@ impl ProfilesView {
         let (Some(e), Some(d), Some(form)) = (&self.editor, &self.data, self.form(cx)) else {
             return div();
         };
-        let result = build_profile(&form, &d.profiles, e.original.as_deref());
+        let result = build_profile(&form, &d.profiles, e.original.as_ref());
         let errs: Vec<FieldError> = result.as_ref().err().cloned().unwrap_or_default();
         let err_of = |f: Field| {
             errs.iter()
@@ -1602,6 +1804,61 @@ impl ProfilesView {
                             },
                         )
                     })),
+            )
+        });
+
+        let kind = e.rule_kind;
+        let rule_locked = e.original.is_some();
+        let rule_field = labeled(
+            &i18n::t("profiles.editor.rule"),
+            div().flex().flex_wrap().gap(SP_2).children(
+                [
+                    (RuleKind::Any, "rule-any", "profiles.editor.rule_any"),
+                    (RuleKind::Exact, "rule-exact", "profiles.editor.rule_exact"),
+                    (RuleKind::Regex, "rule-regex", "profiles.editor.rule_regex"),
+                ]
+                .map(|(k, id, label)| {
+                    chip(
+                        id,
+                        i18n::t(label).into_owned(),
+                        kind == k,
+                        rule_locked,
+                        cx.listener(move |t, _, w, cx| {
+                            if let Some(e) = &mut t.editor {
+                                e.rule_kind = k;
+                                e.rule.update(cx, |s, cx| {
+                                    s.set_placeholder(rule_placeholder(k), w, cx)
+                                });
+                            }
+                            cx.notify();
+                        }),
+                    )
+                }),
+            ),
+            None,
+        )
+        .when(kind != RuleKind::Any, |f| {
+            f.child(Input::new(&e.rule).disabled(rule_locked))
+                .when_some(err_of(Field::Rule), |f, m| {
+                    f.child(div().text_size(TEXT_SM).text_color(danger()).child(m))
+                })
+                .child(
+                    div().text_size(TEXT_SM).text_color(text_muted()).child(
+                        i18n::t(if kind == RuleKind::Regex {
+                            "profiles.editor.rule_hint_regex"
+                        } else {
+                            "profiles.editor.rule_hint_exact"
+                        })
+                        .into_owned(),
+                    ),
+                )
+        })
+        .when(rule_locked, |f| {
+            f.child(
+                div()
+                    .text_size(TEXT_SM)
+                    .text_color(text_muted())
+                    .child(i18n::t("profiles.editor.rule_locked").into_owned()),
             )
         });
 
@@ -1726,6 +1983,11 @@ impl ProfilesView {
             .map(|(i, (l, f))| num(&l, &e.offsets[i], f, has_island)),
         );
         let can_save = result.is_ok() && e.conflicts.is_empty() && !self.saving && !self.read_only;
+        // Both rules (hand-edited file): the form cannot save it, only delete it.
+        let both_rules = e
+            .original
+            .as_ref()
+            .is_some_and(|k| k.title.is_some() && k.title_regex.is_some());
         let enabled_now = e.enabled;
 
         card()
@@ -1736,6 +1998,7 @@ impl ProfilesView {
                     .child(title.into_owned()),
             )
             .child(process_field)
+            .child(rule_field)
             .child(island_row)
             .child(monitor_row)
             .child(labeled(&i18n::t("profiles.editor.offsets"), offs, None))
@@ -1801,15 +2064,40 @@ impl ProfilesView {
                     .flex()
                     .gap(SP_2)
                     .mt(SP_6 - SP_4)
-                    .child(
-                        primary_button(
-                            "save-profile",
-                            i18n::t("profiles.editor.save").into_owned(),
-                            cx.listener(|t, _, _, cx| t.save_editor(cx)),
+                    .when(!both_rules, |row| {
+                        row.child(
+                            primary_button(
+                                "save-profile",
+                                i18n::t("profiles.editor.save").into_owned(),
+                                cx.listener(|t, _, _, cx| t.save_editor(cx)),
+                            )
+                            .icon(IconName::Check)
+                            .disabled(!can_save),
                         )
-                        .icon(IconName::Check)
-                        .disabled(!can_save),
-                    )
+                    })
+                    .when(both_rules, |row| {
+                        row.child(
+                            primary_button(
+                                "editor-delete",
+                                i18n::t("profiles.list.delete").into_owned(),
+                                cx.listener(|t, _, _, cx| {
+                                    let original =
+                                        t.editor.as_ref().and_then(|e| e.original.clone());
+                                    t.confirm_delete = t.data.as_ref().and_then(|d| {
+                                        d.profiles
+                                            .iter()
+                                            .find(|p| Some(ProfileKey::of(p)) == original)
+                                            .cloned()
+                                    });
+                                    t.editor = None;
+                                    t.save_error = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .icon(IconName::Delete)
+                            .disabled(self.saving || self.read_only),
+                        )
+                    })
                     .child(
                         secondary_button(
                             "cancel-profile",
@@ -1836,6 +2124,8 @@ mod tests {
     fn prof(name: &str) -> Profile {
         Profile {
             process: name.into(),
+            title: None,
+            title_regex: None,
             enabled: true,
             monitor: MonitorChoice::Current,
             offsets: Offsets::default(),
@@ -1858,6 +2148,292 @@ mod tests {
         r.unwrap_err().into_iter().map(|e| e.field).collect()
     }
 
+    fn key(process: &str) -> ProfileKey {
+        ProfileKey::from(process)
+    }
+
+    fn titled(process: &str, title: &str) -> Profile {
+        Profile {
+            title: Some(title.into()),
+            ..prof(process)
+        }
+    }
+
+    fn regexed(process: &str, re: &str) -> Profile {
+        Profile {
+            title_regex: Some(re.into()),
+            ..prof(process)
+        }
+    }
+
+    fn ruled(process: &str, rule: RuleKind, text: &str) -> FormInput {
+        FormInput {
+            rule,
+            rule_text: text.into(),
+            ..form(process)
+        }
+    }
+
+    #[test]
+    fn a_title_rule_needs_its_text() {
+        for kind in [RuleKind::Exact, RuleKind::Regex] {
+            for text in ["", "   "] {
+                assert_eq!(
+                    fields(build_profile(&ruled("g.exe", kind, text), &[], None)),
+                    [Field::Rule],
+                    "{kind:?} {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_regex_is_rejected_on_the_rule_field() {
+        let _g = i18n::scoped_locale(Locale::En);
+        let errs =
+            build_profile(&ruled("g.exe", RuleKind::Regex, "(unclosed"), &[], None).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, Field::Rule);
+        assert_eq!(errs[0].message, "Not a valid regular expression");
+    }
+
+    #[test]
+    fn the_rule_lands_in_the_profile_as_title_or_title_regex() {
+        let p = build_profile(&ruled("g.exe", RuleKind::Exact, "  Menu  "), &[], None).unwrap();
+        assert_eq!(
+            (p.title.as_deref(), p.title_regex.as_deref()),
+            (Some("Menu"), None)
+        );
+        let p = build_profile(&ruled("g.exe", RuleKind::Regex, "^Game \\d+$"), &[], None).unwrap();
+        assert_eq!(
+            (p.title.as_deref(), p.title_regex.as_deref()),
+            (None, Some("^Game \\d+$"))
+        );
+        // the text of an unused rule never leaks into an any-window profile
+        let p = build_profile(&ruled("g.exe", RuleKind::Any, "Menu"), &[], None).unwrap();
+        assert_eq!((p.title, p.title_regex), (None, None));
+    }
+
+    #[test]
+    fn a_duplicate_is_a_same_key_not_a_same_process() {
+        let existing = [
+            prof("g.exe"),
+            titled("g.exe", "Menu"),
+            regexed("g.exe", "^A"),
+        ];
+        // other rules next to the process-only profile are fine
+        assert!(build_profile(&ruled("g.exe", RuleKind::Exact, "Other"), &existing, None).is_ok());
+        assert!(build_profile(&ruled("g.exe", RuleKind::Regex, "^B"), &existing, None).is_ok());
+        // same exact title (normalized) or same regex text clashes on the rule
+        for f in [
+            ruled("G.EXE", RuleKind::Exact, "  menu "),
+            ruled("g.exe", RuleKind::Regex, "^A"),
+        ] {
+            assert_eq!(fields(build_profile(&f, &existing, None)), [Field::Rule]);
+        }
+        // a second process-only profile still clashes on the process
+        assert_eq!(
+            fields(build_profile(&form("g.exe"), &existing, None)),
+            [Field::Process]
+        );
+        // editing a profile never clashes with itself
+        let me = ProfileKey::of(&existing[1]);
+        assert!(
+            build_profile(
+                &ruled("g.exe", RuleKind::Exact, "Menu"),
+                &existing,
+                Some(&me)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_form_of_a_ruled_profile_roundtrips() {
+        for p in [titled("g.exe", "Menu"), regexed("g.exe", "^A.*$")] {
+            let again = build_profile(
+                &FormInput::from_profile(&p),
+                std::slice::from_ref(&p),
+                Some(&ProfileKey::of(&p)),
+            )
+            .unwrap();
+            assert_eq!(again, p);
+        }
+    }
+
+    #[test]
+    fn a_profile_with_both_rules_cannot_be_saved_from_the_editor() {
+        let _g = i18n::scoped_locale(Locale::En);
+        let both = Profile {
+            title_regex: Some("^M".into()),
+            ..titled("g.exe", "Menu")
+        };
+        let errs = build_profile(
+            &FormInput::from_profile(&both),
+            std::slice::from_ref(&both),
+            Some(&ProfileKey::of(&both)),
+        )
+        .expect_err("saving would drop the regex and leave the broken profile behind");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, Field::Rule);
+        assert!(errs[0].message.contains("both"), "{}", errs[0].message);
+    }
+
+    #[test]
+    fn the_list_orders_by_process_then_precedence_then_file_order() {
+        let ps = [
+            prof("b.exe"),
+            regexed("a.exe", "^X"),
+            prof("a.exe"),
+            titled("a.exe", "Menu"),
+            regexed("a.exe", "^Y"),
+        ];
+        // a.exe: exact title, regexes in file order, then any window; b.exe last
+        assert_eq!(sorted_filtered(&ps, ""), [3, 1, 4, 2, 0]);
+    }
+
+    #[test]
+    fn the_search_matches_the_rule_text() {
+        let ps = [
+            prof("a.exe"),
+            titled("a.exe", "Main Menu"),
+            regexed("b.exe", "^Lobby"),
+        ];
+        assert_eq!(sorted_filtered(&ps, " menu "), [1]);
+        assert_eq!(sorted_filtered(&ps, "^lobby"), [2]);
+        assert_eq!(sorted_filtered(&ps, "a.exe"), [1, 0]);
+    }
+
+    #[test]
+    fn the_rule_line_and_label_name_the_rule() {
+        let _g = i18n::scoped_locale(Locale::En);
+        assert_eq!(rule_line(&prof("g.exe")), None);
+        assert_eq!(
+            rule_line(&titled("g.exe", "Menu")).as_deref(),
+            Some("Title: \"Menu\"")
+        );
+        assert_eq!(
+            rule_line(&regexed("g.exe", "^M")).as_deref(),
+            Some("Title (regex): ^M")
+        );
+        assert_eq!(rule_label("g.exe", None, None), "g.exe");
+        assert_eq!(
+            rule_label("g.exe", Some("Menu"), None),
+            "g.exe — title \"Menu\""
+        );
+        assert_eq!(rule_label("g.exe", None, Some("^M")), "g.exe — regex ^M");
+    }
+
+    #[test]
+    fn the_new_validation_codes_have_texts_that_name_the_rule() {
+        let _g = i18n::scoped_locale(Locale::En);
+        let data = json!({"process": "g.exe", "title": "Menu"});
+        let re = json!({"process": "g.exe", "title_regex": "^M("});
+        let cases = [
+            (
+                "bad_title",
+                &data,
+                "g.exe — title \"Menu\": the exact title is empty",
+            ),
+            (
+                "bad_title_regex",
+                &re,
+                "g.exe — regex ^M(: the title regular expression is empty or not valid.",
+            ),
+            (
+                "title_rule_conflict",
+                &data,
+                "g.exe — title \"Menu\": a profile can have an exact title",
+            ),
+            (
+                "duplicate_profile",
+                &data,
+                "g.exe — title \"Menu\": more than one profile has this process and rule",
+            ),
+        ];
+        for (code, d, start) in cases {
+            let t = warning_text(&w(code, d.clone()));
+            assert!(t.starts_with(start), "{code}: {t}");
+            let es = {
+                let _g = i18n::scoped_locale(Locale::Es);
+                warning_text(&w(code, d.clone()))
+            };
+            assert_ne!(t, es, "{code} is not translated");
+        }
+        // a process-only warning keeps the plain process
+        assert!(
+            warning_text(&w("duplicate_profile", json!({"process": "g.exe"})))
+                .starts_with("g.exe: more than")
+        );
+    }
+
+    #[test]
+    fn outside_change_follows_the_edited_key_among_profiles_of_one_exe() {
+        let plain = prof("g.exe");
+        let menu = titled("g.exe", "Menu");
+        let mut menu_now = menu.clone();
+        menu_now.delay_ms = 900;
+        let mut plain_now = plain.clone();
+        plain_now.delay_ms = 500;
+        let old = [plain.clone(), menu.clone()];
+        let edited_menu = ProfileKey::of(&menu);
+        // the sibling changed: the editor of the titled profile is untouched
+        assert_eq!(
+            outside_change(Some(&edited_menu), &old, &[plain_now, menu.clone()]),
+            OutsideChange::None
+        );
+        // the edited one changed
+        assert_eq!(
+            outside_change(Some(&edited_menu), &old, &[plain.clone(), menu_now.clone()]),
+            OutsideChange::Changed(Box::new(menu_now))
+        );
+        // the titled one was removed: the process-only editor is not told it changed
+        assert_eq!(
+            outside_change(Some(&key("g.exe")), &old, std::slice::from_ref(&plain)),
+            OutsideChange::None
+        );
+        // the edited one was removed
+        assert_eq!(
+            outside_change(Some(&edited_menu), &old, std::slice::from_ref(&plain)),
+            OutsideChange::Removed
+        );
+    }
+
+    #[test]
+    fn a_rule_changed_outside_is_never_merged_into_the_form() {
+        // the rule is locked while editing: the merge compares the same 11 fields
+        let base = FormInput::from_profile(&titled("g.exe", "Menu"));
+        let mine = base.clone();
+        let theirs = FormInput::from_profile(&titled("g.exe", "Other"));
+        let got = merge_form(&base, &mine, &theirs, &[]);
+        assert_eq!(got.form, mine);
+        assert!(got.conflicts.is_empty());
+    }
+
+    #[test]
+    fn remove_sends_the_full_key_and_upsert_the_profile() {
+        let menu = titled("Game.exe", " Menu ");
+        let p = set_params(Op::Remove(menu.clone()), "r1".into());
+        assert_eq!(p.remove, Some(vec![ProfileKey::of(&menu)]));
+        assert_eq!(p.expected_revision.as_deref(), Some("r1"));
+        assert!(p.profiles.is_none());
+        // a process-only key stays process-only (not widened to the exe's titled profiles)
+        let p = set_params(Op::Remove(prof("game.exe")), "r1".into());
+        assert_eq!(
+            p.remove,
+            Some(vec![ProfileKey::new("game.exe", None, None)])
+        );
+        let p = set_params(Op::Upsert(menu.clone()), "r2".into());
+        assert_eq!(p.profiles, Some(vec![menu]));
+    }
+
+    #[test]
+    fn suggestions_only_skip_processes_with_a_rule_less_profile() {
+        let wins = ["a.exe".to_owned(), "b.exe".to_owned()];
+        let ps = [titled("a.exe", "Menu"), prof("b.exe")];
+        assert_eq!(suggestions(&wins, &ps, "", 6), ["a.exe"]);
+    }
+
     #[test]
     fn outside_change_refills_a_profile_changed_outside() {
         let mut old = prof("game.exe");
@@ -1866,16 +2442,20 @@ mod tests {
         new.delay_ms = 3000;
         let others = prof("other.exe");
         let got = outside_change(
-            Some("GAME.exe"),
+            Some(&key("GAME.exe")),
             &[others.clone(), old],
             &[others, new.clone()],
         );
-        assert_eq!(got, OutsideChange::Changed(new));
+        assert_eq!(got, OutsideChange::Changed(Box::new(new)));
     }
 
     #[test]
     fn outside_change_flags_a_profile_removed_outside() {
-        let got = outside_change(Some("game.exe"), &[prof("game.exe")], &[prof("other.exe")]);
+        let got = outside_change(
+            Some(&key("game.exe")),
+            &[prof("game.exe")],
+            &[prof("other.exe")],
+        );
         assert_eq!(got, OutsideChange::Removed);
     }
 
@@ -1886,7 +2466,7 @@ mod tests {
         other.delay_ms = 5;
         let changed_other = [prof("game.exe"), other];
         assert_eq!(
-            outside_change(Some("game.exe"), &same, &changed_other),
+            outside_change(Some(&key("game.exe")), &same, &changed_other),
             OutsideChange::None
         );
         assert_eq!(
@@ -1897,7 +2477,7 @@ mod tests {
 
     #[test]
     fn outside_notice_is_translated_when_shown() {
-        let notice = Notice::new("profiles.outside.merged", "game.exe");
+        let notice = Notice::new("profiles.outside.merged", &prof("game.exe"));
         let en = {
             let _g = i18n::scoped_locale(Locale::En);
             notice.text()
@@ -1908,6 +2488,24 @@ mod tests {
         };
         assert!(en.starts_with("game.exe was changed outside"), "{en}");
         assert_ne!(en, es);
+    }
+
+    #[test]
+    fn a_notice_names_the_rule_in_the_language_it_is_shown_in() {
+        let notice = {
+            let _g = i18n::scoped_locale(Locale::En);
+            Notice::new("profiles.saved", &titled("game.exe", "Menu"))
+        };
+        let (es, es_label) = {
+            let _g = i18n::scoped_locale(Locale::Es);
+            (notice.text(), rule_label("game.exe", Some("Menu"), None))
+        };
+        let en_label = {
+            let _g = i18n::scoped_locale(Locale::En);
+            rule_label("game.exe", Some("Menu"), None)
+        };
+        assert_ne!(es_label, en_label, "the rule label is translated");
+        assert!(es.contains(&es_label), "{es}");
     }
 
     #[test]
@@ -1939,10 +2537,10 @@ mod tests {
             fields(build_profile(&form("c:\\x\\game.exe"), &existing, None)),
             [Field::Process]
         );
-        assert!(build_profile(&form("game.exe"), &existing, Some("Game.exe")).is_ok());
+        assert!(build_profile(&form("game.exe"), &existing, Some(&key("Game.exe"))).is_ok());
         // renaming onto another existing profile is still a duplicate
         let two = [prof("a.exe"), prof("b.exe")];
-        assert!(build_profile(&form("b.exe"), &two, Some("a.exe")).is_err());
+        assert!(build_profile(&form("b.exe"), &two, Some(&key("a.exe"))).is_err());
     }
 
     #[test]
@@ -2077,7 +2675,12 @@ mod tests {
             height: 720,
         });
         assert_eq!(
-            build_profile(&FormInput::from_profile(&p), &[p.clone()], Some("Game.exe")).unwrap(),
+            build_profile(
+                &FormInput::from_profile(&p),
+                &[p.clone()],
+                Some(&key("Game.exe"))
+            )
+            .unwrap(),
             p
         );
     }
@@ -2580,7 +3183,12 @@ mod tests {
         let mine = with(|f| f.delay = "200".into());
         let mut p = prof("g.exe");
         p.offsets.top = 7;
-        let got = after_reload(Some(&base), &mine, &[], &OutsideChange::Changed(p));
+        let got = after_reload(
+            Some(&base),
+            &mine,
+            &[],
+            &OutsideChange::Changed(Box::new(p)),
+        );
         let want = with(|f| {
             f.delay = "200".into();
             f.offsets[1] = "7".into();
@@ -2599,7 +3207,7 @@ mod tests {
         // Delay conflicted before (mine 200); outside did not touch it again.
         let base = form("g.exe");
         let mine = with(|f| f.delay = "200".into());
-        let change = OutsideChange::Changed(prof("g.exe"));
+        let change = OutsideChange::Changed(Box::new(prof("g.exe")));
         let kept = after_reload(Some(&base), &mine, &[Field::Delay], &change);
         assert_eq!(
             kept,
@@ -2628,7 +3236,7 @@ mod tests {
         let mut p = prof("g.exe");
         p.delay_ms = 300;
         p.offsets.top = 7;
-        let got = after_reload(None, &mine, &[], &OutsideChange::Changed(p));
+        let got = after_reload(None, &mine, &[], &OutsideChange::Changed(Box::new(p)));
         assert_eq!(
             got,
             ReloadOutcome::Merge(Box::new(Merged {
@@ -2766,6 +3374,201 @@ mod tests {
         );
     }
 
+    /// `game.exe` twice: any window and exact title "Menu".
+    fn two_of_one_exe(
+        plain_delay: u64,
+        menu_delay: u64,
+        revision: &str,
+    ) -> Result<Reply<Data>, String> {
+        let mut plain = prof("game.exe");
+        plain.delay_ms = plain_delay;
+        let mut menu = titled("game.exe", "Menu");
+        menu.delay_ms = menu_delay;
+        Ok(Reply::Ok(Data {
+            path: "profiles.json".into(),
+            revision: revision.into(),
+            profiles: vec![plain, menu],
+            warnings: Vec::new(),
+            layouts: Vec::new(),
+            islands: Vec::new(),
+            monitors: Vec::new(),
+            processes: Vec::new(),
+        }))
+    }
+
+    fn loaded_two(cx: &mut TestAppContext) -> (VisualTestContext, Entity<ProfilesView>) {
+        let (mut cx, view) = open_view(cx);
+        cx.run_until_parked();
+        cx.update(|_, app| {
+            view.update(app, |v, cx| v.apply_load(two_of_one_exe(100, 0, "r1"), cx))
+        });
+        (cx, view)
+    }
+
+    #[gpui_kit::test]
+    fn only_a_row_with_a_rule_shows_the_rule_line(cx: &mut TestAppContext) {
+        let (mut cx, _view) = loaded_two(cx);
+        assert!(element(&mut cx, "rule-1").is_some_and(|e| e.visible()));
+        assert!(element(&mut cx, "rule-0").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn the_editor_of_a_titled_profile_is_by_key_and_keeps_its_rule(cx: &mut TestAppContext) {
+        let (mut cx, view) = loaded_two(cx);
+        click(&mut cx, "edit-1");
+        let (original, kind, text) = cx.update(|_, app| {
+            let e = view.read(app).editor.as_ref().expect("editor open");
+            (
+                e.original.clone(),
+                e.rule_kind,
+                e.rule.read(app).value().to_string(),
+            )
+        });
+        assert_eq!(original, Some(ProfileKey::of(&titled("game.exe", "Menu"))));
+        assert_eq!((kind, text.as_str()), (RuleKind::Exact, "Menu"));
+        // the rule is locked: a chip click does not change it
+        click(&mut cx, "rule-any");
+        assert_eq!(
+            cx.update(|_, app| view.read(app).editor.as_ref().map(|e| e.rule_kind)),
+            Some(RuleKind::Exact)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn an_outside_change_to_the_sibling_leaves_the_open_editor_alone(cx: &mut TestAppContext) {
+        let (mut cx, view) = loaded_two(cx);
+        click(&mut cx, "edit-1");
+        // the process-only profile of the same exe changes outside
+        cx.update(|_, app| {
+            view.update(app, |v, cx| v.apply_load(two_of_one_exe(777, 0, "r2"), cx))
+        });
+        cx.run_until_parked();
+        let (refill, conflicts, original) = cx.update(|_, app| {
+            let v = view.read(app);
+            let e = v.editor.as_ref().expect("editor open");
+            let merged = v.refill.is_some() || v.outside.is_some();
+            (merged, e.conflicts.clone(), e.original.clone())
+        });
+        assert!(!refill && conflicts.is_empty(), "no merge for the sibling");
+        assert!(original.is_some(), "still editing the titled profile");
+        // its own change is a real outside change
+        cx.update(|_, app| {
+            view.update(app, |v, cx| {
+                v.apply_load(two_of_one_exe(777, 900, "r3"), cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, app| view.read(app).outside.is_some()),
+            "its own change is merged"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn deleting_a_titled_profile_confirms_by_its_full_key(cx: &mut TestAppContext) {
+        let (mut cx, view) = loaded_two(cx);
+        click(&mut cx, "delete-1");
+        let asked = cx.update(|_, app| view.read(app).confirm_delete.clone());
+        let victim = asked.expect("confirmation open");
+        assert_eq!(
+            ProfileKey::of(&victim),
+            ProfileKey::of(&titled("game.exe", "Menu"))
+        );
+        assert!(element(&mut cx, "delete-confirm").is_some_and(|e| e.visible()));
+    }
+
+    #[gpui_kit::test]
+    fn diagnose_opens_the_profile_that_matches_the_window_title(cx: &mut TestAppContext) {
+        let (mut cx, view) = loaded_two(cx);
+        let open = |cx: &mut VisualTestContext, title: &'static str| {
+            cx.update(|w, app| {
+                view.update(app, |v, cx| {
+                    v.prefill_resolution("Game.exe", Some(title), 1920, 1080, w, cx)
+                })
+            });
+            cx.update(|_, app| {
+                let e = view.read(app).editor.as_ref().expect("editor open");
+                (e.original.clone(), e.width.read(app).value().to_string())
+            })
+        };
+        let (original, width) = open(&mut cx, "menu");
+        assert_eq!(original, Some(ProfileKey::of(&titled("game.exe", "Menu"))));
+        assert_eq!(width, "1920");
+        let (original, _) = open(&mut cx, "In game");
+        assert_eq!(original, Some(key("game.exe")));
+    }
+
+    #[gpui_kit::test]
+    fn diagnose_without_the_window_title_opens_the_process_only_profile(cx: &mut TestAppContext) {
+        let (mut cx, view) = open_view(cx);
+        cx.run_until_parked();
+        let data = Data {
+            path: "profiles.json".into(),
+            revision: "r1".into(),
+            profiles: vec![prof("game.exe"), regexed("game.exe", ".*")],
+            warnings: Vec::new(),
+            layouts: Vec::new(),
+            islands: Vec::new(),
+            monitors: Vec::new(),
+            processes: Vec::new(),
+        };
+        cx.update(|_, app| view.update(app, |v, cx| v.apply_load(Ok(Reply::Ok(data)), cx)));
+        cx.update(|w, app| {
+            view.update(app, |v, cx| {
+                v.prefill_resolution("Game.exe", None, 1920, 1080, w, cx)
+            })
+        });
+        let original = cx.update(|_, app| {
+            view.read(app)
+                .editor
+                .as_ref()
+                .and_then(|e| e.original.clone())
+        });
+        // The title is unknown: a regex that accepts any title must not be guessed.
+        assert_eq!(original, Some(key("game.exe")));
+    }
+
+    #[gpui_kit::test]
+    fn a_profile_with_both_rules_offers_only_delete_in_the_editor(cx: &mut TestAppContext) {
+        let (mut cx, view) = open_view(cx);
+        cx.run_until_parked();
+        let both = Profile {
+            title_regex: Some("^M".into()),
+            ..titled("game.exe", "Menu")
+        };
+        let data = Data {
+            path: "profiles.json".into(),
+            revision: "r1".into(),
+            profiles: vec![both],
+            warnings: Vec::new(),
+            layouts: Vec::new(),
+            islands: Vec::new(),
+            monitors: Vec::new(),
+            processes: Vec::new(),
+        };
+        cx.update(|_, app| view.update(app, |v, cx| v.apply_load(Ok(Reply::Ok(data)), cx)));
+        click(&mut cx, "edit-0");
+        click(&mut cx, "editor-delete");
+        let (editing, asked) = cx.update(|_, app| {
+            let v = view.read(app);
+            (v.editor.is_some(), v.confirm_delete.is_some())
+        });
+        assert!(
+            !editing && asked,
+            "the editor closes into the delete confirmation"
+        );
+        assert!(element(&mut cx, "delete-confirm").is_some_and(|e| e.visible()));
+    }
+
+    #[gpui_kit::test]
+    fn a_new_profile_can_pick_a_title_rule(cx: &mut TestAppContext) {
+        let (mut cx, view) = loaded_two(cx);
+        click(&mut cx, "new-profile");
+        click(&mut cx, "rule-regex");
+        let kind = cx.update(|_, app| view.read(app).editor.as_ref().map(|e| e.rule_kind));
+        assert_eq!(kind, Some(RuleKind::Regex));
+    }
+
     // ---------------------------------------------------------- properties
 
     use proptest::prelude::*;
@@ -2797,6 +3600,8 @@ mod tests {
             .prop_map(
                 |(enabled, island, monitor, o, (delay, width, height))| FormInput {
                     process: "g.exe".into(),
+                    rule: RuleKind::Any,
+                    rule_text: String::new(),
                     enabled,
                     island: island.map(String::from),
                     monitor,

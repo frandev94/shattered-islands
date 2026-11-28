@@ -786,6 +786,8 @@ mod tests {
     fn profile(process: &str, island: &str, game: Option<(i32, i32)>) -> Profile {
         Profile {
             process: process.into(),
+            title: None,
+            title_regex: None,
             enabled: true,
             monitor: Default::default(),
             offsets: Default::default(),

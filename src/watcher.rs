@@ -1,4 +1,4 @@
-//! WinEvent hooks that notify the message-only window about new/foregrounded windows.
+//! WinEvent hooks that notify the message-only window about new, foregrounded and renamed windows.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::Win32::Foundation::{E_INVALIDARG, HWND as RawHwnd};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
+    EVENT_OBJECT_STATECHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND,
+    EVENT_SYSTEM_MOVESIZESTART, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 use crate::win32::{self, HWND, Win32Error};
@@ -20,6 +20,8 @@ pub const WM_SHATTER_WINDOW: u32 = 0x8000 + 1;
 pub const WM_SHATTER_CHANGED: u32 = 0x8000 + 3;
 /// WM_APP + 4; wparam = watched hwnd, lparam 1 = move/size started, 0 = ended.
 pub const WM_SHATTER_MOVESIZE: u32 = 0x8000 + 4;
+/// WM_APP + 6; wparam = hwnd as usize. A top-level window's title changed.
+pub const WM_SHATTER_RENAMED: u32 = 0x8000 + 6;
 
 /// Message window that receives `WM_SHATTER_WINDOW`; 0 until `start()` runs.
 static TARGET: AtomicIsize = AtomicIsize::new(0);
@@ -41,7 +43,7 @@ impl Drop for Watcher {
 
 extern "system" fn on_event(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: RawHwnd,
     id_object: i32,
     id_child: i32,
@@ -56,9 +58,14 @@ extern "system" fn on_event(
         return;
     }
     if win32::is_top_level(hwnd) && win32::is_visible(hwnd) {
+        let msg = if event == EVENT_OBJECT_NAMECHANGE {
+            WM_SHATTER_RENAMED
+        } else {
+            WM_SHATTER_WINDOW
+        };
         let _ = win32::post_message(
             win32::hwnd_from_isize(target),
-            WM_SHATTER_WINDOW,
+            msg,
             win32::hwnd_to_isize(hwnd) as usize,
         );
     }
@@ -69,9 +76,13 @@ extern "system" fn on_event(
 pub fn start(target: HWND) -> win32::Result<Watcher> {
     TARGET.store(win32::hwnd_to_isize(target), Ordering::Relaxed);
     let mut watcher = Watcher {
-        hooks: Vec::with_capacity(2),
+        hooks: Vec::with_capacity(3),
     };
-    for event in [EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND] {
+    for event in [
+        EVENT_OBJECT_SHOW,
+        EVENT_SYSTEM_FOREGROUND,
+        EVENT_OBJECT_NAMECHANGE,
+    ] {
         // SAFETY: `on_event` has the WINEVENTPROC signature and lives for the whole process;
         // no module handle is needed for WINEVENT_OUTOFCONTEXT.
         let hook = unsafe {
