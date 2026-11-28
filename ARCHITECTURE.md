@@ -88,6 +88,9 @@ waiting for its `delay_ms`, keeps its profile whatever its title becomes.
   pipe name is a hard error.
 - **Framing**: one JSON object per line, with unique keys at every level, at most `MAX_LINE` (1 MiB). Methods and payloads live in
   `ipc/mod.rs`; `hello` returns `PROTOCOL` (3) and clients refuse a different value.
+  The CLI, the MCP server and the panel all check it (`ipc::check_hello` / `hello_protocol`); the
+  panel checks `hello` before every request and shows a distinct status for a mismatched resident,
+  so no request is ever sent to one.
 - **Errors**: `ErrorBody { code, message }`. Clients match `code`, never the English message; transport
   failures carry `os error N` instead of the localized OS text.
 - **Timeouts**: a client waits at most 70 s for one reply (`READ_TIMEOUT` = `max(MAX_DELAY_MS + PENDING_GRACE_MS, MAX_OBSERVE_MS)` + 6 s), which only bounds a resident

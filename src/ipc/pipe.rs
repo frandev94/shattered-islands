@@ -796,4 +796,34 @@ mod tests {
         drop(c);
         server.stop();
     }
+
+    /// The panel's checked connect sends nothing but `hello` to a resident on another protocol.
+    /// Needs a free pipe name (no resident instance running).
+    #[test]
+    #[ignore]
+    fn checked_connect_refuses_a_mismatched_resident_before_any_request() {
+        use crate::gui::{Failure, connect_checked};
+        use crate::ipc::PROTOCOL;
+        use std::sync::Mutex;
+
+        let protocol = Arc::new(Mutex::new(PROTOCOL + 1));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (p, s) = (protocol.clone(), seen.clone());
+        let server = spawn_server(Arc::new(move |req| {
+            let (tx, rx) = oneshot::channel();
+            let n = *p.lock().expect("protocol");
+            s.lock().expect("seen").push(req.method.clone());
+            let _ = tx.send(Response::ok(req.id, json!({"protocol": n})));
+            rx
+        }))
+        .expect("server");
+        assert_eq!(
+            connect_checked().err(),
+            Some(Failure::Protocol(PROTOCOL + 1))
+        );
+        assert_eq!(*seen.lock().expect("seen"), ["hello"]);
+        *protocol.lock().expect("protocol") = PROTOCOL;
+        assert!(connect_checked().is_ok());
+        server.stop();
+    }
 }

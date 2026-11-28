@@ -73,6 +73,8 @@ Tests: `cargo test` runs the unit, property and doc tests. The suites that open 
 3. Create or edit profiles in the panel, or in [`profiles.json`](#profiles) followed by "Reload profiles".
 4. When a window of a process with a profile opens, its frame is removed and it is fitted to its monitor or island.
 
+If the resident that is running comes from another version (a different IPC protocol), the panel says so in the sidebar and sends it no request until you restart it, the same way the CLI and the MCP server refuse it.
+
 Tray menu:
 
 | Action | Effect |
