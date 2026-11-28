@@ -2,6 +2,12 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.9] - 2026-11-28
+
+### 🐛 Bug Fixes
+
+- *(gui)* Refuse a resident that speaks another IPC protocol
+
 ## [0.2.8] - 2026-11-28
 
 ### 🚀 Features
