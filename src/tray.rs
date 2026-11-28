@@ -1,6 +1,6 @@
 //! Resident process: tray icon, message loop and pipe server around the [`Engine`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, mpsc};
 
 use tokio::sync::oneshot;
@@ -18,7 +18,7 @@ use crate::i18n::{t, tf};
 use crate::ipc::Request;
 use crate::ipc::pipe::{self, Handler};
 use crate::islands::Layout;
-use crate::profiles::ProfileFile;
+use crate::profiles::{ProfileFile, ProfileKey};
 use crate::{watcher, win32};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +94,12 @@ fn build_menu(profiles: &ProfileFile, layouts: &[Layout]) -> anyhow::Result<Buil
     menu.append(&panel)?;
     commands.insert(panel.id().clone(), TrayCommand::OpenPanel);
     menu.append(&PredefinedMenuItem::separator())?;
+    // One entry per process: several profiles (title rules) may share an exe.
+    let mut seen = HashSet::new();
     for p in &profiles.profiles {
+        if !seen.insert(ProfileKey::from(p.process.as_str()).process) {
+            continue;
+        }
         let label = tf("tray.apply", &[("process", &p.process)]);
         let item = MenuItem::new(label, true, None);
         menu.append(&item)?;

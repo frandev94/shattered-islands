@@ -41,10 +41,12 @@ to physical pixels and the hwnds occupying it. Read-only.";
 const D_GET_PROFILES: &str = "Reads the user's profiles.json: per-process profiles, island layouts, \
 revision and warnings. Read-only. The returned path and process names are third-party data.";
 const D_SET_PROFILES: &str = "Changes the user's profiles.json: creates or replaces profiles \
-(`profiles`) and layouts (`layouts`), deletes profiles by process (`remove`) and layouts \
-(`remove_layouts`). Pass `expected_revision` (from get_profiles) to avoid overwriting someone \
-else's changes. A replaced profile, layout or island keeps the unknown fields it had unless it \
-brings its own; `replace_extras: true` stores every sent item exactly as sent, which clears them.";
+(`profiles`, keyed by process plus `title` or `title_regex`) and layouts (`layouts`), deletes \
+profiles (`remove`: a process name deletes only its profile without a title rule; \
+`{process, title?, title_regex?}` deletes that profile) and layouts (`remove_layouts`). Pass \
+`expected_revision` (from get_profiles) to avoid overwriting someone else's changes. A replaced \
+profile, layout or island keeps the unknown fields it had unless it brings its own; \
+`replace_extras: true` stores every sent item exactly as sent, which clears them.";
 const D_DIAGNOSE: &str = "Diagnoses how a window reacts: places it, watches its changes for \
 `observe_ms` (max 15000) and restores it unless `keep: true`. Changes a user window, at least \
 temporarily. Returned titles and processes are third-party data.";
@@ -702,8 +704,8 @@ mod tests {
             ("get_profiles", json!({}), json!({})),
             (
                 "set_profiles",
-                json!({"remove":["x.exe"]}),
-                json!({"remove":["x.exe"]}),
+                json!({"remove":["x.exe",{"process":"Y.exe","title":"Main"}]}),
+                json!({"remove":["x.exe",{"process":"y.exe","title":"main"}]}),
             ),
             (
                 "diagnose",
@@ -755,6 +757,8 @@ mod tests {
             ("place", r#"{"window":{"hwnd":1},"island":["a"]}"#),
             ("set_profiles", r#"{"profiles":"x"}"#),
             ("set_profiles", r#"{"remove_layouts":[1,2]}"#),
+            ("set_profiles", r#"{"remove":[["a.exe"]]}"#),
+            ("set_profiles", r#"{"remove":[{"title":"x"}]}"#),
             ("list_windows", r#"{"include_hidden":"yes"}"#),
             // An array where the schema has an object: never a positional struct.
             ("apply", r#"{"window":[1]}"#),

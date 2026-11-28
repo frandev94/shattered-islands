@@ -715,6 +715,22 @@ mod tests {
     }
 
     #[test]
+    fn profiles_set_body_with_remove_object_passes_the_local_parse() {
+        let body = br#"{"remove":["a.exe",{"process":"b.exe","title":"Main"},{"process":"c.exe","title_regex":"^X"}]}"#;
+        let r = p_body(&["profiles", "set", "-"], body);
+        assert_eq!(
+            r,
+            Ok(Parsed::Call(Invocation {
+                method: "set_profiles",
+                params: serde_json::from_slice(body).unwrap(),
+                pretty: false,
+            }))
+        );
+        let bad = br#"{"remove":[{"process":"b.exe","title":["Main"]}]}"#;
+        assert!(p_body(&["profiles", "set", "-"], bad).is_err());
+    }
+
+    #[test]
     fn profiles_set_accepts_utf8_bom() {
         let mut body = b"\xEF\xBB\xBF".to_vec();
         body.extend(br#"{"remove_layouts":["x"]}"#);

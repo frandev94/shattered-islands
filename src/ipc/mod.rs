@@ -29,12 +29,12 @@ use serde_json::Value;
 
 use crate::diagnose::{Latencies, Recommendation, Verdict};
 use crate::islands::{Layout, MonitorInfo, MonitorSel, Size};
-use crate::profiles::{Profile, Warning};
+use crate::profiles::{Profile, ProfileKey, Warning};
 use crate::win32::DpiAwareness;
 use crate::window_state::{Offsets, Rect};
 
 /// Protocol revision returned by `hello`; clients must refuse a different one.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// Maximum length of one JSON line (without the trailing `\n`).
 pub const MAX_LINE: usize = 1 << 20;
 /// Upper bound of `diagnose.observe_ms`.
@@ -797,14 +797,15 @@ pub struct GetProfilesResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SetProfilesParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Profiles to insert or replace (by process file name).
+    /// Profiles to insert or replace, by [`ProfileKey`] (process file name and title rule).
     pub profiles: Option<Vec<Profile>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Layouts to insert or replace (by id).
     pub layouts: Option<Vec<Layout>>,
-    /// Process names to delete.
+    /// Profiles to delete: a process name deletes its process-only profile,
+    /// `{process, title?, title_regex?}` the profile with that key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remove: Option<Vec<String>>,
+    pub remove: Option<Vec<ProfileKey>>,
     /// Layout ids to delete.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_layouts: Vec<String>,
@@ -1297,7 +1298,41 @@ mod tests {
             "/layouts/0/islands/0",
         );
         rejected::<SetProfilesParams>(json!({"remove": [["a.exe"]]}), "/remove/0");
+        rejected::<SetProfilesParams>(
+            json!({"remove": [{"process": "a.exe", "title": ["x"]}]}),
+            "/remove/0/title",
+        );
         rejected::<SetProfilesParams>(json!({"remove_layouts": [["l"]]}), "/remove_layouts/0");
+    }
+
+    #[test]
+    fn remove_items_are_a_process_name_or_a_key_object() {
+        let p: SetProfilesParams = accepted(json!({"remove": [
+            "a.exe",
+            {"process": "B.exe", "title": " Main "},
+            {"process": "c.exe", "title_regex": "^X", "title": null}
+        ]}));
+        assert_eq!(
+            p.remove,
+            Some(vec![
+                ProfileKey::new("a.exe", None, None),
+                ProfileKey::new("b.exe", Some("main"), None),
+                ProfileKey::new("c.exe", None, Some("^X")),
+            ])
+        );
+        // A misspelt rule field is an error, never the process-only key (it would delete that).
+        for bad in [
+            json!({"remove": [1]}),
+            json!({"remove": [{"title": "x"}]}),
+            json!({"remove": [{"process": "a.exe", "titel": "x"}]}),
+        ] {
+            assert_eq!(
+                parse_params::<SetProfilesParams>(bad.clone())
+                    .expect_err(&bad.to_string())
+                    .code,
+                ErrorCode::InvalidParams
+            );
+        }
     }
 
     #[test]

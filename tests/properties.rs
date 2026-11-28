@@ -17,7 +17,7 @@ use borderless_shatter::islands::{
     island_rect_on,
 };
 use borderless_shatter::profiles::{
-    self, MonitorChoice, Profile, ProfileError, ProfileFile, SUPPORTED_VERSION,
+    self, MonitorChoice, Profile, ProfileError, ProfileFile, ProfileKey, SUPPORTED_VERSION,
 };
 use borderless_shatter::window_state::{
     EXSTYLE_REMOVE, Offsets, Rect, STYLE_REMOVE, borderless_styles, target_rect,
@@ -170,7 +170,11 @@ fn arb_layout_any() -> impl Strategy<Value = Layout> {
 
 fn arb_profile() -> impl Strategy<Value = Profile> {
     (
-        any::<String>(),
+        (
+            any::<String>(),
+            proptest::option::of(any::<String>()),
+            proptest::option::of(any::<String>()),
+        ),
         any::<bool>(),
         prop_oneof![
             Just(MonitorChoice::Current),
@@ -185,7 +189,7 @@ fn arb_profile() -> impl Strategy<Value = Profile> {
     )
         .prop_map(
             |(
-                process,
+                (process, title, title_regex),
                 enabled,
                 monitor,
                 offsets,
@@ -197,6 +201,8 @@ fn arb_profile() -> impl Strategy<Value = Profile> {
             )| {
                 Profile {
                     process,
+                    title,
+                    title_regex,
                     enabled,
                     monitor,
                     offsets,
@@ -729,6 +735,8 @@ fn one_island_layout(id: &str, island: &str, rect: IslandRect) -> Layout {
 fn plain_profile(process: &str) -> Profile {
     Profile {
         process: process.into(),
+        title: None,
+        title_regex: None,
         enabled: true,
         monitor: MonitorChoice::Current,
         offsets: Offsets::default(),
@@ -897,6 +905,119 @@ proptest! {
         longer.push(0);
         prop_assert_ne!(&profiles::revision(&longer), &r);
     }
+
+    /// Property 1: `find` returns a profile whose rule matches, of the lowest level (exact <
+    /// regex < process only) among the matching ones, the first in file order at that level;
+    /// `None` only if none matches or the process is excluded.
+    #[test]
+    fn find_picks_the_most_specific_match_in_file_order(
+        ps in vec(ruled_profile(), 0..8),
+        process in prop::sample::select(PROCESSES),
+        title in prop::sample::select(TITLES),
+    ) {
+        let expected = if profiles::is_excluded(process) {
+            None
+        } else {
+            ps.iter()
+                .enumerate()
+                .filter(|(_, p)| p.process.eq_ignore_ascii_case(process))
+                .filter_map(|(i, p)| level(p, title).map(|l| (l, i)))
+                .min()
+                .map(|(_, i)| i)
+        };
+        let got = profiles::find(&ps, process, title)
+            .map(|p| ps.iter().position(|q| std::ptr::eq(p, q)).unwrap());
+        prop_assert_eq!(got, expected);
+    }
+
+    /// Property 2: after `upsert` no two profiles share a key (on a file without duplicates),
+    /// and sending the same profiles again changes nothing.
+    #[test]
+    fn upsert_keeps_keys_unique_and_is_idempotent(
+        old in vec(ruled_profile(), 0..8),
+        sent in vec(ruled_profile(), 0..6),
+    ) {
+        let mut file = file_with(vec![], unique_keys(old));
+        profiles::upsert(&mut file, sent.clone(), vec![], vec![], vec![], false);
+        let keys: Vec<ProfileKey> = file.profiles.iter().map(ProfileKey::of).collect();
+        let unique: std::collections::HashSet<&ProfileKey> = keys.iter().collect();
+        prop_assert_eq!(unique.len(), keys.len());
+        let once = file.clone();
+        profiles::upsert(&mut file, sent, vec![], vec![], vec![], false);
+        prop_assert_eq!(file, once);
+    }
+
+    /// Property 3: removing a key leaves every other profile intact and in order; a process-name
+    /// `remove` never deletes a profile with a title rule.
+    #[test]
+    fn remove_drops_exactly_that_key(
+        ps in vec(ruled_profile(), 0..8),
+        key in ruled_profile().prop_map(|p| ProfileKey::of(&p)),
+        name in prop::sample::select(PROCESSES),
+    ) {
+        let mut file = file_with(vec![], ps.clone());
+        profiles::upsert(&mut file, vec![], vec![], vec![key.clone()], vec![], false);
+        let kept: Vec<Profile> = ps.iter().filter(|p| ProfileKey::of(p) != key).cloned().collect();
+        prop_assert_eq!(&file.profiles, &kept);
+        let mut file = file_with(vec![], ps.clone());
+        let by_name: ProfileKey = serde_json::from_value(json!(name)).unwrap();
+        profiles::upsert(&mut file, vec![], vec![], vec![by_name], vec![], false);
+        let ruled = |v: &[Profile]| -> Vec<Profile> {
+            v.iter().filter(|p| p.title.is_some() || p.title_regex.is_some()).cloned().collect()
+        };
+        prop_assert_eq!(ruled(&file.profiles), ruled(&ps));
+    }
+}
+
+const PROCESSES: &[&str] = &["a.exe", "A.EXE", "b.exe", "explorer.exe"];
+const TITLES: &[&str] = &["Main", " main ", "MAIN 2", "Lev3", "", "("];
+
+/// Profiles over a small alphabet, so keys, titles and processes collide often.
+fn ruled_profile() -> impl Strategy<Value = Profile> {
+    let rule = prop_oneof![
+        Just((None, None)),
+        prop::sample::select(vec!["Main", " MAIN", "main 2", "", " "])
+            .prop_map(|t| (Some(t.to_owned()), None)),
+        prop::sample::select(vec!["^Main$", "(?i)main", "\\d", "(", ""])
+            .prop_map(|r| (None, Some(r.to_owned()))),
+        Just((Some("Main".to_owned()), Some("Main".to_owned()))),
+    ];
+    (
+        prop::sample::select(PROCESSES),
+        rule,
+        any::<bool>(),
+        0u64..3,
+    )
+        .prop_map(
+            |(process, (title, title_regex), enabled, delay_ms)| Profile {
+                title,
+                title_regex,
+                enabled,
+                delay_ms,
+                ..plain_profile(process)
+            },
+        )
+}
+
+/// Oracle for the precedence level of `p` for `title`, written from the README rules.
+fn level(p: &Profile, title: &str) -> Option<u8> {
+    let norm = |s: &str| s.trim().to_lowercase();
+    match (&p.title, &p.title_regex) {
+        (None, None) => Some(2),
+        (Some(t), None) => (!t.trim().is_empty() && norm(t) == norm(title)).then_some(0),
+        (None, Some(r)) => regex::Regex::new(r)
+            .is_ok_and(|re| !r.is_empty() && re.is_match(title))
+            .then_some(1),
+        (Some(_), Some(_)) => None,
+    }
+}
+
+/// `ps` without the profiles whose key an earlier one already has.
+fn unique_keys(ps: Vec<Profile>) -> Vec<Profile> {
+    let mut seen = std::collections::HashSet::new();
+    ps.into_iter()
+        .filter(|p| seen.insert(ProfileKey::of(p)))
+        .collect()
 }
 
 #[test]
@@ -1048,11 +1169,24 @@ fn arb_diagnose() -> impl Strategy<Value = DiagnoseParams> {
         )
 }
 
+/// A `remove` item: a process name or a key object, normalized like the resident reads it.
+fn arb_key() -> impl Strategy<Value = ProfileKey> {
+    prop_oneof![
+        any::<String>().prop_map(|s| ProfileKey::from(s.as_str())),
+        (
+            any::<String>(),
+            proptest::option::of(any::<String>()),
+            proptest::option::of(any::<String>()),
+        )
+            .prop_map(|(p, t, r)| ProfileKey::new(&p, t.as_deref(), r.as_deref())),
+    ]
+}
+
 fn arb_set_profiles() -> impl Strategy<Value = SetProfilesParams> {
     (
         proptest::option::of(vec(arb_profile(), 0..3)),
         proptest::option::of(vec(arb_layout_any(), 0..3)),
-        proptest::option::of(vec(any::<String>(), 0..3)),
+        proptest::option::of(vec(arb_key(), 0..3)),
         vec(any::<String>(), 0..3),
         proptest::option::of(any::<String>()),
         any::<bool>(),
